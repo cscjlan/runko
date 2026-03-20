@@ -63,3 +63,13 @@ nm --line-numbers --defined-only "$object_file" | \
     sort | \
     uniq | \
     less
+
+# TODO
+# If line has at least two words separated by a space,
+# then run clang-format on it with
+# BreakAfterReturnType=RTBS_All
+# and remove the first line
+# basically separate every line with only one word on it into a separate stream,
+# operate with clang-format on the multiword stream then remove every second line starting from the first, then remove
+# everything after the first ( on each line,
+# then recombine the streams
