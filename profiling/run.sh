@@ -1,0 +1,57 @@
+#!/bin/bash -l
+#SBATCH --account=project_462000007
+#SBATCH --partition=standard-g
+#SBATCH --job-name=decay
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=6
+#SBATCH --mem-per-cpu=8GB
+#SBATCH --time=0-00:20:00       # Run time (d-hh:mm:ss)
+
+# Load correct modules here.
+source $RUNKODIR/runko-venv/bin/activate
+ml perftools-base
+ml perftools
+
+cd $RUNKODIR/projects/pic-turbulence/
+
+cat << EOF > select_gpu
+#!/bin/bash
+export ROCR_VISIBLE_DEVICES=\$SLURM_LOCALID
+
+exec \$*
+EOF
+
+chmod +x ./select_gpu
+
+CPU_BIND="mask_cpu:7e000000000000,7e00000000000000"
+CPU_BIND="${CPU_BIND},7e0000,7e000000"
+CPU_BIND="${CPU_BIND},7e,7e00"
+CPU_BIND="${CPU_BIND},7e00000000,7e0000000000"
+
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
+export MPICH_GPU_SUPPORT_ENABLED=1
+export MPICH_GPU_IPC_ENABLED=0
+
+# -------- rocprofv3 settings ---------
+ROCPROFV3="rocprofv3"
+ROCPROFV3="${ROCPROFV3} --output-format pftrace"
+ROCPROFV3="${ROCPROFV3} --sys-trace"
+# This is not supported on 6.3.4
+#ROCPROFV3="${ROCPROFV3} --collection-period 60:1:5"
+ROCPROFV3="${ROCPROFV3} --output-directory $RUNKODIR/rocproftraces/%job%"
+ROCPROFV3="${ROCPROFV3} --output-file %launch_time%-%hostname%-%pid%-%rank%.pftrace"
+ROCPROFV3="${ROCPROFV3} --"
+
+# -------- CrayPat settings ---------
+export PAT_RT_EXPDIR_NAME=/scratch/project_462001137/$USER/runko/craypat_experiments
+mkdir -p $PAT_RT_EXPDIR_NAME
+
+# Choose the profiler to use
+PROFILER=pat_run
+#PROFILER="${ROCPROFV3}"
+
+srun --cpu-bind=${CPU_BIND} ./select_gpu $PROFILER python pic.py
+
+rm -f ./select_gpu
