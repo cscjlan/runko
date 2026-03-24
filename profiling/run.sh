@@ -11,8 +11,6 @@
 
 # Load correct modules here.
 source $RUNKODIR/runko-venv/bin/activate
-ml perftools-base
-ml perftools
 
 cd $RUNKODIR/projects/pic-turbulence/
 
@@ -44,12 +42,9 @@ ROCPROFV3="${ROCPROFV3} --output-directory $RUNKODIR/rocproftraces/%job%"
 ROCPROFV3="${ROCPROFV3} --output-file %launch_time%-%hostname%-%pid%-%rank%.pftrace"
 ROCPROFV3="${ROCPROFV3} --"
 
-# -------- CrayPat settings ---------
-export PAT_RT_EXPDIR_NAME=/scratch/project_462001137/$USER/runko/craypat_experiments
-mkdir -p $PAT_RT_EXPDIR_NAME
 
-# Choose the profiler to use
-PROFILER=pat_run
+# -------- Choose the profiler ---------
+PROFILER=
 #PROFILER="${ROCPROFV3}"
 
 srun --cpu-bind=${CPU_BIND} ./select_gpu $PROFILER python pic.py
