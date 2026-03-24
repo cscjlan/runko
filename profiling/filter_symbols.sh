@@ -7,13 +7,13 @@ object_file=""
 
 for arg in "$@"; do
     case "$arg" in
-        --exclude-file-patterns=*)
+        --file-patterns=*)
             # Extract the comma-separated list after the equals sign
-            file_patterns="${arg#--exclude-file-patterns=}"
+            file_patterns="${arg#--file-patterns=}"
             ;;
-        --exclude-function-patterns=*)
+        --function-patterns=*)
             # Extract the comma-separated list after the equals sign
-            function_patterns="${arg#--exclude-function-patterns=}"
+            function_patterns="${arg#--function-patterns=}"
             ;;
         *)
             # Treat as object file
@@ -45,8 +45,6 @@ fi
 # demangle those with llvm-cxxfilt,
 # then do the same sed/grep inverse matching but on human readable functions this time.
 # Then we sort and throw away dublicates.
-# TODO: add comma to every line, then format with clang-format,
-# then remove return value and arguments, only use the function name.
 nm --line-numbers --defined-only "$object_file" | \
     if [ -n $file_patterns ]; then \
         grep --invert-match --extended-regexp $(echo $file_patterns | sed -E 's/\\?([^,]*|,),?/--regexp=\1 /g'); \
@@ -62,14 +60,9 @@ nm --line-numbers --defined-only "$object_file" | \
     fi | \
     sort | \
     uniq | \
+    sed 's/,/\\,/g' | \
+    tr '\n' ',' | \
     less
 
-# TODO
-# If line has at least two words separated by a space,
-# then run clang-format on it with
-# BreakAfterReturnType=RTBS_All
-# and remove the first line
-# basically separate every line with only one word on it into a separate stream,
-# operate with clang-format on the multiword stream then remove every second line starting from the first, then remove
-# everything after the first ( on each line,
-# then recombine the streams
+#sed -E 's/^([^<(\[]*)(.*)$/\1/' | \
+#sed -E 's/.* ([^ ]+)$/\1/' | \
