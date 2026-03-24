@@ -10,9 +10,15 @@
 #SBATCH --time=0-00:20:00       # Run time (d-hh:mm:ss)
 
 # Load correct modules here.
-source $RUNKODIR/runko-venv/bin/activate
+source ${RUNKODIR}/runko-venv/bin/activate
 
-cd $RUNKODIR/projects/pic-turbulence/
+ml LUMI/25.03
+ml partition/G
+ml Score-P/9.4-cpeCray-25.03-rocm
+
+ml
+
+cd /scratch/project_462001137/${USER}/runko
 
 cat << EOF > select_gpu
 #!/bin/bash
@@ -38,15 +44,36 @@ ROCPROFV3="${ROCPROFV3} --output-format pftrace"
 ROCPROFV3="${ROCPROFV3} --sys-trace"
 # This is not supported on 6.3.4
 #ROCPROFV3="${ROCPROFV3} --collection-period 60:1:5"
-ROCPROFV3="${ROCPROFV3} --output-directory $RUNKODIR/rocproftraces/%job%"
+ROCPROFV3="${ROCPROFV3} --output-directory rocproftraces/%job%"
 ROCPROFV3="${ROCPROFV3} --output-file %launch_time%-%hostname%-%pid%-%rank%.pftrace"
 ROCPROFV3="${ROCPROFV3} --"
+
+# -------- scorep settings ---------
+export SCOREP_EXPERIMENT_DIRECTORY=scorep/${SLURM_JOBID}
+
+export SCOREP_ENABLE_PROFILING=1
+export SCOREP_PROFILING_MAX_CALLPATH_DEPTH=110
+
+export SCOREP_ENABLE_TRACING=0
+
+# TODO: create filter
+#export SCOREP_FILTERING_FILE=${RUNKODIR}/scorep-filter
+
+#export SCOREP_METRIC_PAPI=PAPI_FP_OPS,PAPI_L2_TCM
+export SCOREP_MPI_ENABLE_GROUPS=DEFAULT
+export SCOREP_HIP_ENABLE=yes
+
+#export SCOREP_HIP_ACTIVITY_BUFFER_SIZE=1M
+#export SCOREP_TOTAL_MEMORY=3G
 
 
 # -------- Choose the profiler ---------
 PROFILER=
 #PROFILER="${ROCPROFV3}"
 
-srun --cpu-bind=${CPU_BIND} ./select_gpu $PROFILER python pic.py
+#PYTHON=python
+PYTHON="python -m scorep --compiler --mpp=mpi --instrumenter-type=cProfile"
+
+srun --cpu-bind=${CPU_BIND} ./select_gpu $PROFILER ${PYTHON} ${RUNKODIR}/projects/pic-turbulence/pic.py
 
 rm -f ./select_gpu

@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --account=project_462001137
+#SBATCH --account=project_462000007
 #SBATCH --partition=standard-g
 #SBATCH --job-name=decay
 #SBATCH --nodes=1
@@ -32,10 +32,12 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MPICH_GPU_SUPPORT_ENABLED=1
 export MPICH_GPU_IPC_ENABLED=0
 
+# -------- rocprofv3 settings ---------
 ROCPROFV3="rocprofv3"
 ROCPROFV3="${ROCPROFV3} --output-format pftrace"
 ROCPROFV3="${ROCPROFV3} --sys-trace"
-ROCPROFV3="${ROCPROFV3} --collection-period 60:1:5"
+# This is not supported on 6.3.4
+#ROCPROFV3="${ROCPROFV3} --collection-period 60:1:5"
 ROCPROFV3="${ROCPROFV3} --output-directory $RUNKODIR/rocproftraces/%job%"
 ROCPROFV3="${ROCPROFV3} --output-file %launch_time%-%hostname%-%pid%-%rank%.pftrace"
 ROCPROFV3="${ROCPROFV3} --"

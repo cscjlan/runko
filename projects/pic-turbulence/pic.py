@@ -20,14 +20,14 @@ if __name__ == "__main__":
     config = runko.Configuration(None)
 
     config.outdir = "turb-small"
-    config.Nx = 1
-    config.Ny = 1
-    config.Nz = 1
+    config.Nx = 8
+    config.Ny = 8
+    config.Nz = 8
     config.NxMesh = 64
     config.NyMesh = 64
     config.NzMesh = 64
     config.cfl = 0.45
-    config.Nt = 5.0*config.Nx*config.NxMesh/config.cfl/3.0 # =5eddy turnover times
+    config.Nt = 10
     config.xmin = 0
     config.ymin = 0
     config.zmin = 0
@@ -40,10 +40,9 @@ if __name__ == "__main__":
     config.current_filter = "binomial2"
     config.tile_partitioning = "hilbert_curve"
 
-
     # Problem specific configuration
-    ppc = 2 # particles per cell (one particle type)
-    oppc = 2 * ppc # overall particles per cell (all particle types)
+    ppc = 2  # particles per cell (one particle type)
+    oppc = 2 * ppc  # overall particles per cell (all particle types)
     gamma = 1
     c_omp = 1
     omp = config.cfl / c_omp
@@ -54,9 +53,9 @@ if __name__ == "__main__":
     m0 = config.m0 * abs(config.q0)
     m1 = config.m1 * abs(config.q1)
 
-    delgam = 0.3 # temperature
-    temp_ration = 1 # T_i / T_e
-    sigma = 10 # magnetization (omega_ce/omega_pe)^2
+    delgam = 0.3  # temperature
+    temp_ration = 1  # T_i / T_e
+    sigma = 10  # magnetization (omega_ce/omega_pe)^2
 
     delgam0 = delgam
     delgam1 = temp_ration * delgam0
@@ -64,15 +63,15 @@ if __name__ == "__main__":
     # No corrections; cold sigma
     binit_nc = np.sqrt(oppc * (config.cfl**2.0) * sigma * m0)
     # another approximation which is more accurate at \delta ~ 1
-    gammath = 1.0 + (3.0/2.0) * delgam1
+    gammath = 1.0 + (3.0 / 2.0) * delgam1
 
     binit_approx = np.sqrt(gammath * oppc * m0 * (config.cfl**2.0) * sigma)
-    binit = binit_approx # NOTE: selecting this as our sigma definitions
+    binit = binit_approx  # NOTE: selecting this as our sigma definitions
 
     logger.info(f"Positron thermal spread: {delgam1}")
     logger.info(f"Electron thermal spread: {delgam0}")
     logger.info(f"Alfven vel: {np.sqrt(sigma / (1. + sigma))}")
-    ion_beta = 2. * delgam1 / (sigma * (m1 /m0 + 1.) / (m1 /m0 ))
+    ion_beta = 2.0 * delgam1 / (sigma * (m1 / m0 + 1.0) / (m1 / m0))
     logger.info(f"Ion beta: {ion_beta}")
     logger.info(f"Electron beta: {2.*delgam0/(sigma*(1/m0+1.))}")
     logger.info(f"sigma: {sigma}")
@@ -112,10 +111,10 @@ if __name__ == "__main__":
 
     def Bx(x, y, z):
         bx = np.zeros_like(x)
-        x, y = y, x # done indirectly in pic-trubulence/antenna3d.py
+        x, y = y, x  # done indirectly in pic-trubulence/antenna3d.py
         I = range(1, n_perp + 1)
         for n, m in itertools.product(I, I):
-            norm = beta(n ,m)
+            norm = beta(n, m)
             for o in range(1, n_par + 1):
                 xmodx = np.sin(m * kx * x + ph1[n - 1, m - 1, o - 1])
                 xmody = np.cos(n * ky * y + ph2[n - 1, m - 1, o - 1])
@@ -126,10 +125,10 @@ if __name__ == "__main__":
 
     def By(x, y, z):
         by = np.zeros_like(x)
-        x, y = y, x # done indirectly in pic-trubulence/antenna3d.py
+        x, y = y, x  # done indirectly in pic-trubulence/antenna3d.py
         I = range(1, n_perp + 1)
         for n, m in itertools.product(I, I):
-            norm = beta(n ,m)
+            norm = beta(n, m)
             for o in range(1, n_par + 1):
                 ymodx = np.cos(m * kx * x + ph1[n - 1, m - 1, o - 1])
                 ymody = np.sin(n * ky * y + ph2[n - 1, m - 1, o - 1])
@@ -140,7 +139,6 @@ if __name__ == "__main__":
 
     Bz = lambda x, y, z: np.full_like(x, binit)
     zero_field = lambda x, y, z: np.zeros_like(x)
-
 
     def pgen0(x, y, z):
         N = len(x)
@@ -168,9 +166,17 @@ if __name__ == "__main__":
     if not tile_grid.initialized_from_restart_file():
         for idx in tile_grid.local_tile_indices():
             tile = runko.pic.threeD.Tile(idx, config)
-            tile.batch_set_EBJ(zero_field, zero_field, zero_field,
-                               Bx, By, Bz,
-                               zero_field, zero_field, zero_field)
+            tile.batch_set_EBJ(
+                zero_field,
+                zero_field,
+                zero_field,
+                Bx,
+                By,
+                Bz,
+                zero_field,
+                zero_field,
+                zero_field,
+            )
             for _ in range(ppc):
                 runko.runko_logger().info("Injecting particles of type 0...")
                 tile.batch_inject_to_cells(0, pgen0)
