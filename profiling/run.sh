@@ -81,25 +81,24 @@ ROCPROFV3="${ROCPROFV3} --"
 
 # -------- scorep settings ---------
 export SCOREP_EXPERIMENT_DIRECTORY=scorep/${SLURM_JOBID}
-export SCOREP_ENABLE_PROFILING=1
+export SCOREP_ENABLE_PROFILING=0
 export SCOREP_PROFILING_MAX_CALLPATH_DEPTH=110
-export SCOREP_ENABLE_TRACING=0
-#export SCOREP_FILTERING_FILE=${RUNKODIR}/profiling/scorep.filter
+export SCOREP_ENABLE_TRACING=1
+export SCOREP_FILTERING_FILE=${RUNKODIR}/profiling/scorep.filter
 #export SCOREP_METRIC_PAPI=PAPI_FP_OPS,PAPI_L2_TCM
 export SCOREP_MPI_ENABLE_GROUPS=DEFAULT
 export SCOREP_HIP_ENABLE=yes
 #export SCOREP_HIP_ACTIVITY_BUFFER_SIZE=1M
-#export SCOREP_TOTAL_MEMORY=3G
+export SCOREP_TOTAL_MEMORY=100MB
 
 PYTHON_SCOREP="python -m scorep"
 # Change this to tracing when performing tracing with scorep
-PYTHON_SCOREP="${PYTHON_SCOREP} --instrumenter-type=cProfile"
+PYTHON_SCOREP="${PYTHON_SCOREP} --instrumenter-type=cTrace"
 PYTHON_SCOREP="${PYTHON_SCOREP} --compiler"
 PYTHON_SCOREP="${PYTHON_SCOREP} --mpp=mpi"
 PYTHON_SCOREP="${PYTHON_SCOREP} --hip"
 PYTHON_SCOREP="${PYTHON_SCOREP} --thread=none"
 PYTHON_SCOREP="${PYTHON_SCOREP} --memory"
-PYTHON_SCOREP="${PYTHON_SCOREP} --io=posix"
 
 # -------- Choose the profiler ---------
 # Don't run multiple profilers at the same time (e.g. rocprofv3 and scorep)
