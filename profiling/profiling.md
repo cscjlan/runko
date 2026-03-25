@@ -173,7 +173,7 @@ PYTHON_SCOREP="${PYTHON_SCOREP} --memory"
 PYTHON_SCOREP="${PYTHON_SCOREP} --io=posix"
 ```
 
-See profiling/run.sh for a complete example.
+See `profiling/run.sh` for a complete example.
 
 More help:
 - Using a filter: https://scorepci.pages.jsc.fz-juelich.de/scorep-pipelines/docs/scorep-5.0-rc1/html/score.html
