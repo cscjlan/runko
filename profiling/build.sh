@@ -18,6 +18,6 @@ cmake \
     -DCMAKE_CXX_COMPILER=scorep-CC \
     -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
 
-export SCOREP_WRAPPER_INSTRUMENTER_FLAGS=--verbose=2 --mpp=mpi --thread=none --io=posix --compiler --hip
+export SCOREP_WRAPPER_INSTRUMENTER_FLAGS="--verbose=2 --memory --mpp=mpi --thread=none --io=posix --compiler --hip"
 
 cmake --build build --target runko_cpp_bindings -j 16
