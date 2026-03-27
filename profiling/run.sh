@@ -54,20 +54,16 @@ case "${PROFILER}" in
         # Tracing generates potentially gigabytes of data.
         # Read the Score-P documentation for more information.
         # https://perftools.pages.jsc.fz-juelich.de/cicd/scorep/tags/latest/html/workflow.html
-        USE_TRACING=0
+        USE_TRACING=1
 
         if [ ${USE_TRACING} -eq 0 ]; then
-            MEASURING="Profiling"
-
             export SCOREP_ENABLE_TRACING=0
             export SCOREP_ENABLE_PROFILING=1
             PYTHON_SCOREP_INSTRUMENTER_TYPE="cProfile"
         else
-            MEASURING="Tracing"
-
             export SCOREP_ENABLE_TRACING=1
             export SCOREP_ENABLE_PROFILING=0
-            PYTHON_OSCOREP_INSTRUMENTER_TYPE="cTrace"
+            PYTHON_SCOREP_INSTRUMENTER_TYPE="cTrace"
         fi
 
         # -------- settings applying to both, profiling and tracing ---------
@@ -108,9 +104,10 @@ EOF
         export SCOREP_MPI_ENABLE_GROUPS=DEFAULT
         export SCOREP_HIP_ENABLE=api,kernel,kernel_callsite,malloc,memcpy,sync,default
         export SCOREP_HIP_ACTIVITY_BUFFER_SIZE=16M
-        export SCOREP_TOTAL_MEMORY=100MB
+        export SCOREP_TOTAL_MEMORY=4000MB
 
         PYTHON_SCOREP="python -m scorep"
+        #PYTHON_SCOREP="${PYTHON_SCOREP} --noinstrumenter"
         PYTHON_SCOREP="${PYTHON_SCOREP} --instrumenter-type=${PYTHON_SCOREP_INSTRUMENTER_TYPE}"
         PYTHON_SCOREP="${PYTHON_SCOREP} ${PARADIGMS_USED}"
 
@@ -119,8 +116,6 @@ EOF
 
         ;;
     rocprofv3)
-        MEASURING="Profiling"
-
         # -------- rocprofv3 settings ---------
         ROCPROFV3="rocprofv3"
         ROCPROFV3="${ROCPROFV3} --output-format pftrace"
@@ -153,7 +148,7 @@ RUNKO_PROJECT="${RUNKODIR}/projects/pic-turbulence/pic.py"
 # ALL is necessary so the exported variables from this file are also propagated.
 RUNKO_SRUN_OPTIONS=""
 RUNKO_SRUN_OPTIONS="${RUNKO_SRUN_OPTIONS} --cpu-bind=${CPU_BIND}"
-RUNKO_SRUN_OPTIONS="${RUNKO_SRUN_OPTIONS} --export=ALL,LD_PRELOAD=${PRELOADED_LIBS}"
+#RUNKO_SRUN_OPTIONS="${RUNKO_SRUN_OPTIONS} --export=ALL,LD_PRELOAD=${PRELOADED_LIBS}"
 
 srun ${RUNKO_SRUN_OPTIONS} ./select_gpu ${PROFILER_CMD} ${PYTHON_CMD} ${RUNKO_PROJECT}
 
