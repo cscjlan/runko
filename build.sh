@@ -40,7 +40,7 @@ python -m pip install \
     scikit-build-core \
     viztracer
 
-pip install --no-build-isolation -v -e /projappl/project_462001358/juhanala/runko \
+pip install --no-build-isolation -v -e ${RUNKODIR} \
       --config-settings=cmake.args=--preset=lumi-gpu
 
 # Make squashfs?

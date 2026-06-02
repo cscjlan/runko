@@ -28,7 +28,11 @@ fi
 
 source ${RUNKODIR}/venv/bin/activate
 
-cd ${RUNKODIR}/projects/pic-turbulence/
+export RUNKO_RUNDIR=/tmp/$USER/pic-trace-run
+
+mkdir -p ${RUNKO_RUNDIR}
+cd ${RUNKO_RUNDIR}
+cp ${RUNKODIR}/projects/pic-turbulence/pic.py pic.py
 
 cat << EOF > select_gpu
 #!/bin/bash
@@ -48,6 +52,17 @@ export OMP_NUM_THREADS=6
 export MPICH_GPU_SUPPORT_ENABLED=1
 export MPICH_GPU_IPC_ENABLED=0
 
-srun --cpu-bind=${CPU_BIND} ./select_gpu python -m viztracer --pid_suffix pic.py
+export VIZTRACER_OUTPUT_DIR=/scratch/project_462001358/$USER/runko_profiles/ppc/${SLURM_JOB_ID}
+mkdir -p $VIZTRACER_OUTPUT_DIR
+
+for ppc in 2 4 8 16 32 64 128 256 512 1024 2048
+do
+    sed -i "s/\(^[ ]\{4\}ppc =\) [0-9]*/\1 ${ppc}/" pic.py
+    srun --cpu-bind=${CPU_BIND} ./select_gpu python -m viztracer --pid_suffix --log_sparse pic.py
+    viztracer --combine result*.json --output_file ${VIZTRACER_OUTPUT_DIR}/ppc_$ppc.json
+    rm result*.json
+done
 
 rm -f ./select_gpu
+cd
+rm -rf /tmp/$USER
