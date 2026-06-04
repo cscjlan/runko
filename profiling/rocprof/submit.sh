@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --account=project_462001358
 #SBATCH --partition=standard-g
-#SBATCH --job-name=runko-batch-inject-profile
+#SBATCH --job-name=runko-rocprof-trace
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
@@ -28,11 +28,11 @@ fi
 
 source ${RUNKODIR}/venv/bin/activate
 
-export RUNKO_RUNDIR=/tmp/$USER/batch_inject_to_cells
+export RUNKO_RUNDIR=/tmp/$USER/rocprof-trace-run
 
 mkdir -p ${RUNKO_RUNDIR}
 cd ${RUNKO_RUNDIR}
-cp ${RUNKODIR}/profiling/batch_inject_to_cells/pic.py pic.py
+cp ${RUNKODIR}/profiling/rocprof/pic.py pic.py
 
 cat << EOF > select_gpu
 #!/bin/bash
@@ -52,12 +52,18 @@ export OMP_NUM_THREADS=6
 export MPICH_GPU_SUPPORT_ENABLED=1
 export MPICH_GPU_IPC_ENABLED=0
 
-export VIZTRACER_OUTPUT_DIR=/scratch/project_462001358/$USER/runko_profiles/${SLURM_JOB_ID}_batch_inject_to_cells
-mkdir -p $VIZTRACER_OUTPUT_DIR
+export OUTPUT_DIR=/scratch/project_462001358/$USER/runko_profiles/${SLURM_JOB_ID}_rocprof_trace
+mkdir -p $OUTPUT_DIR
 
-srun --cpu-bind=${CPU_BIND} ./select_gpu python -m viztracer --pid_suffix --log_sparse pic.py
-viztracer --combine result*.json --output_file ${VIZTRACER_OUTPUT_DIR}/combined.json
-rm result*.json
+ROCPROFV3="rocprofv3"
+ROCPROFV3="${ROCPROFV3} --sys-trace"
+ROCPROFV3="${ROCPROFV3} --collection-period 60:1:5"
+ROCPROFV3="${ROCPROFV3} --output-format pftrace"
+ROCPROFV3="${ROCPROFV3} --output-directory ${OUTPUT_DIR}"
+ROCPROFV3="${ROCPROFV3} --output-file %launch_time%-%hostname%-%pid%-%rank%.pftrace"
+ROCPROFV3="${ROCPROFV3} --"
+
+srun --cpu-bind=${CPU_BIND} ./select_gpu ${ROCPROFV3} python pic.py
 
 rm -f ./select_gpu
 cd

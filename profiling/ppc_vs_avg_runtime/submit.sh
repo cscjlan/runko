@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --account=project_462001358
 #SBATCH --partition=standard-g
-#SBATCH --job-name=decay
+#SBATCH --job-name=runko-ppc-profile
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
@@ -28,7 +28,7 @@ fi
 
 source ${RUNKODIR}/venv/bin/activate
 
-export RUNKO_RUNDIR=/tmp/$USER/pic-trace-run
+export RUNKO_RUNDIR=/tmp/$USER/ppc_vs_avg_runtime
 
 mkdir -p ${RUNKO_RUNDIR}
 cd ${RUNKO_RUNDIR}
@@ -65,4 +65,4 @@ done
 
 rm -f ./select_gpu
 cd
-rm -rf /tmp/$USER
+rm -rf ${RUNKO_RUNDIR}
