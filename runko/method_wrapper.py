@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import inspect
-from viztracer import get_tracer
 
 
 class MethodWrapper:
@@ -84,8 +83,7 @@ class MethodWrapper:
                     raise TypeError(msg)
 
             self._pre(name, *vargs, **kwargs) if self._pre else None
-            with get_tracer().log_event(name):
-                self._action(name, *vargs, **kwargs)
+            self._action(name, *vargs, **kwargs)
             self._post(name, *vargs, **kwargs) if self._post else None
 
         return wrapped_method_call
