@@ -20,3 +20,8 @@ Otherwise, run one of the other experiments.
 
 Follow the READMEs in the individual directories.
 
+## TODO
+
+- [ ] Install Score-P
+- [ ] Compile python from sources so perf can be used
+- [ ] maybe rocprof-sdk and automatic instrumentation with `cyg_enter`?

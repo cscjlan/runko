@@ -30,7 +30,7 @@ if __name__ == "__main__":
     config.NyMesh = 64
     config.NzMesh = 64
     config.cfl = 0.45
-    config.Nt = 20
+    config.Nt = 5.0*config.Nx*config.NxMesh/config.cfl/3.0 # =5eddy turnover times
     config.xmin = 0
     config.ymin = 0
     config.zmin = 0

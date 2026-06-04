@@ -32,5 +32,6 @@ cd ${RUNKODIR}
 # We assume here that dependencies have already been installed to the virtual environment
 source venv/bin/activate
 
+# TODO need to use Score-P to instrument the files
 pip install --no-build-isolation -v -e ${RUNKODIR} \
       --config-settings=cmake.args=--preset=lumi-gpu
