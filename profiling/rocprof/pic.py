@@ -23,12 +23,12 @@ if __name__ == "__main__":
     config = runko.Configuration(None)
 
     config.outdir = "turb-small"
-    config.Nx = 1
-    config.Ny = 1
-    config.Nz = 1
-    config.NxMesh = 64
-    config.NyMesh = 64
-    config.NzMesh = 64
+    config.Nx = 2
+    config.Ny = 2
+    config.Nz = 2
+    config.NxMesh = 128
+    config.NyMesh = 128
+    config.NzMesh = 128
     config.cfl = 0.45
     config.Nt = 20
     config.xmin = 0

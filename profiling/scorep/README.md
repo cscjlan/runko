@@ -1,6 +1,6 @@
-# rocprofv3
+# Profiling
 
-# Score-P
+TODO rewrite after installing Score-P & testing this
 
 ## Installing and setup
 
