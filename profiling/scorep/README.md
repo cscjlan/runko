@@ -6,6 +6,18 @@ Score-P does not understand the `.c++` extension used by runko.
 To instrument with Score-P, the extensions have to be changed
 to a more common extension, e.g. `.cpp`.
 
+### TL;DR
+
+Apply [these](./corgi.patch) [patches](./runko.patch)
+in the runko repository to rename the desired files
+(patch based on commit 25cebc59dc2ab144f57c6e714781e9c15bf97a9d)
+```bash
+git -C external/corgi/ apply ../../profiling/scorep/corgi.patch
+git apply profiling/scorep/runko.patch
+```
+
+### Manually
+
 It takes some manual fiddling, but here are helpful scripts.
 
 Run this in the runko repository to get a list of source files that
@@ -13,215 +25,41 @@ refer to `.c++`:
 ```bash
 grep -rI "\.c++" | awk -F: '{print $1}' | sort | uniq
 ```
+most of them are tests/prototypes/other and not of interest.
 
-It may produce something like
+These commands rename the `.c++` files of interest under [src](../../src)
+and [external](../../external/).
+The files under `src` are changed based on the extension,
+and thus take new files in to account.
+The libraries under `external` are mostly header-only,
+with mostly tests/prototypes with a `.c++` extension,
+so the file(s) to change are hard coded here.
 ```
-docs/Doxyfile.in
-external/corgi/examples/game-of-life/CMakeLists.txt
-external/corgi/examples/particles/CMakeLists.txt
-external/corgi/mpi4cpp/test/CMakeLists.txt
-external/corgi/pycorgi/CMakeLists.txt
-external/corgi/tests/CMakeLists.txt
-external/corgi/viesti/makefile
-external/corgi/viesti/viesti.c++
-external/tyvi/test/CMakeLists.txt
-profiling/build_scorep_old.sh
-profiling/scorep/README.md
-prototypes/cpp-pic/Doxyfile
-prototypes/sparse-vlasov-mesh/velomesh.h
-src/CMakeLists.txt
-src/runko/pic/reflector_wall.c++
-tests/cpp/CMakeLists.txt
+# src
+sed -i 's/\.c++/\.cpp/' src/CMakeLists.txt
+for file in $(find src/ -name "*.c++"); do mv $file "${file:0:-3}cpp"; done
+
+# external/
+sed -i 's/\.c++/\.cpp/' external/corgi/pycorgi/CMakeLists.txt
+mv external/corgi/pycorgi/pycorgi.c++ external/corgi/pycorgi/pycorgi.cpp
 ```
 
-We'll remove some of those by hand to get the ones
-that are used for building runko
-(note that this list may change):
-```
-external/corgi/pycorgi/CMakeLists.txt
-external/corgi/viesti/makefile
-external/corgi/viesti/viesti.c++
-src/CMakeLists.txt
-```
+## Installing Score-P
 
+Score-P and the python package `scorep` need to be installed.
+See the scripts [install_scorep.sh](../install_scorep.sh) and
+[install_dependencies.sh](../install_dependencies.sh).
 
+## Instrumenting
 
+The script [build_instrumented.sh](../build_instrumented.sh)
+can be used to build runko with instrumentation.
 
-## Installing and setup
+## Running
 
-Use the EasyBuild installed module:
-```bash
-export EBU_USER_PREFIX=/projappl/project_462001137/EB
-
-ml LUMI/25.03
-ml partition/G
-ml Score-P/9.4-cpeCray-25.03-rocm
-```
-
-If the [python bindings](https://github.com/score-p/scorep_binding_python) are not installed,
-install them to venv **after** loading the Score-P module:
-```bash
-source runko-venv/bin/activate
-
-pip install scorep
-```
-
-## Usage
-
-You can read the official documentation describing the workflow of Score-P measurement [here](https://perftools.pages.jsc.fz-juelich.de/cicd/scorep/tags/latest/html/workflow.html).
-
-### Instrumenting C++
-
-For some reason Score-P does not understand the `.c++` file extension. Thus, the files to be instrumented should be renamed
-to `*.cpp`.
-
-It's beneficial to run the non-instrumented version of the case being profiled first to get a sense of the run time.
-This run time can then be compared to the run time of the instrumented version(s) to have some clue about the overhead.
-
--------------------
-
-To build an instrumented version, pass the `scorep` wrapper as the compiler to CMake:
-```bash
-SCOREP_WRAPPER=off \
-cmake \
-    -B build \
-    -S . \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DCMAKE_CXX_COMPILER=scorep-CC \
-    -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
-
-export SCOREP_WRAPPER_INSTRUMENTER_FLAGS="--verbose=2 --memory --mpp=mpi --thread=none --io=posix --compiler --hip"
-
-cmake --build build --target runko_cpp_bindings -j 16
-```
-Using `SCOREP_WRAPPER=off` is necessary for CMake, as it uses the given compiler during the configuration step,
-and we don't want to instrument the internal CMake test cases, which may fail.
-
-See [the docs](https://perftools.pages.jsc.fz-juelich.de/cicd/scorep/tags/latest/html/scorepwrapper.html) for more info.
-
-#### Full example build file
-```bash
-#!/bin/bash
-
-source runko-venv/bin/activate
-
-export EBU_USER_PREFIX=/projappl/project_462001137/EB
-
-ml LUMI/25.03
-ml partition/G
-ml Score-P/9.4-cpeCray-25.03-rocm
-
-ml
-
-SCOREP_WRAPPER=off \
-cmake \
-    -B build \
-    -S . \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DCMAKE_CXX_COMPILER=scorep-CC \
-    -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
-
-export SCOREP_WRAPPER_INSTRUMENTER_FLAGS="--verbose=2 --memory --mpp=mpi --thread=none --io=posix --compiler --hip"
-
-cmake --build build --target runko_cpp_bindings -j 16
-```
-
-### Instrumenting Python
-
-The Python code is instrumented automatically during runtime by the `scorep` module. No build steps necessary.
-
-### Sampling the Code
-
-Sampling and profiling the code requires some extra steps. We'll go through them step by step.
-
-Load the modules:
-
-```bash
-source ${RUNKODIR}/runko-venv/bin/activate
-
-ml LUMI/25.03
-ml partition/G
-ml Score-P/9.4-cpeCray-25.03-rocm
-```
-
-Next, compile a dummy shared library for filtering out some MPI functions from Score-P profiling.
-Score-P uses its own MPI profiling library and Score-P has a filtering mechanism, but this mechanism
-does not support filtering out MPI functions. Groups of MPI functions can be filtered out, with
-`export SCOREP_MPI_ENABLE_GROUPS=DEFAULT` but it can be coarse grained. See [the documentation](https://scorepci.pages.jsc.fz-juelich.de/scorep-pipelines/docs/scorep-5.0-rc1/html/wrapperannex.html) for more help.
-
-```bash
-LIB_FNAME=runko_mpi_preload
-
-cat << EOF | CC -x c++ --std=c++20 -fPIC -O2 -g -shared -o "${LIB_FNAME}.so" -
-#include <mpi.h>
-
-extern "C" {
-    int MPI_Test(MPI_Request *request, int *flag, MPI_Status *status) {
-      return PMPI_Test(request, flag, status);
-    }
-
-    int MPI_Comm_rank(MPI_Comm comm, int* rank) {
-      return PMPI_Comm_rank(comm, rank);
-    }
-}
-EOF
-```
-
-We'll be using this library with `export LD_PRELOAD="${RUNKODIR}/${LIB_FNAME}.so"`,
-so recompiling/relinking of runko is not necessary.
-
--------------------------
-
-Tracing and profiling can generate a lot of data, so we'll be running
-from a data directory on `/scratch`:
-
-```bash
-RUNKO_DATADIR="/scratch/project_462001137/${USER}/runko"
-mkdir -p ${RUNKO_DATADIR}
-cd ${RUNKO_DATADIR}
-```
-
-Score-P runtime is controlled with environment variables,
-while the python module can be controlled by passing command line arguments to it:
-```bash
-# Relative to CWD
-export SCOREP_EXPERIMENT_DIRECTORY=scorep/${SLURM_JOBID}
-# Don't use profiling and tracing at the same time
-export SCOREP_ENABLE_PROFILING=1
-export SCOREP_PROFILING_MAX_CALLPATH_DEPTH=110
-export SCOREP_ENABLE_TRACING=0
-
-# Use a filter file for tracing
-#export SCOREP_FILTERING_FILE=${RUNKODIR}/profiling/scorep.filter
-
-# PAPI can be used as well
-#export SCOREP_METRIC_PAPI=PAPI_FP_OPS,PAPI_L2_TCM
-
-# Which MPI groups to profile/trace
-export SCOREP_MPI_ENABLE_GROUPS=DEFAULT
-
-# Which parts of HIP to enable
-export SCOREP_HIP_ENABLE=yes
-#export SCOREP_HIP_ACTIVITY_BUFFER_SIZE=1M
-#export SCOREP_TOTAL_MEMORY=3G
-
-# Enable the same settings for Python
-# as were used when the C++ code was instrumented
-PYTHON_SCOREP="python -m scorep"
-# Change this to tracing when performing tracing with scorep
-PYTHON_SCOREP="${PYTHON_SCOREP} --instrumenter-type=cProfile"
-PYTHON_SCOREP="${PYTHON_SCOREP} --compiler"
-PYTHON_SCOREP="${PYTHON_SCOREP} --mpp=mpi"
-PYTHON_SCOREP="${PYTHON_SCOREP} --hip"
-PYTHON_SCOREP="${PYTHON_SCOREP} --thread=none"
-PYTHON_SCOREP="${PYTHON_SCOREP} --memory"
-PYTHON_SCOREP="${PYTHON_SCOREP} --io=posix"
-```
-
-See `profiling/run.sh` for a complete example.
-
-More help:
-- Using a filter: https://scorepci.pages.jsc.fz-juelich.de/scorep-pipelines/docs/scorep-5.0-rc1/html/score.html
-- Environment variables: https://scorepci.pages.jsc.fz-juelich.de/scorep-pipelines/docs/scorep-5.0-rc1/html/scorepmeasurementconfig.html
-- Python Score-P bindings: https://github.com/score-p/scorep_binding_python
-    - Useful to check the issues for extra information
+Use the [submit.sh](./submit.sh) script to run: `sbatch submit.sh`.
+Read the
+[Score-P](https://perftools.pages.jsc.fz-juelich.de/cicd/scorep/tags/latest/html/workflow.html)
+and
+[scorep python package](https://github.com/score-p/scorep_binding_python)
+documentation for more info on how to use Score-P.
