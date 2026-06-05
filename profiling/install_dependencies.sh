@@ -21,8 +21,6 @@ ml buildtools
 ml cray-python
 ml lumi-CrayPath
 
-# TODO: install Score-P manually, there's no EB for LUMI/25.09
-
 if [ ! -d ${RUNKODIR} ]
 then
     echo "Set the variable RUNKODIR to point to the runko repository directory"
@@ -37,7 +35,11 @@ source venv/bin/activate
 
 MPI4PY_BUILD_MPICC=cc python -m pip install --no-cache-dir --no-binary=mpi4py mpi4py
 
-# N.B. This'll fail before Score-P has been installed
+# N.B. Installing the scorep python package requires an installed Score-P.
+# `scorep-config` should be in PATH.
+# You can use the ./install_scorep.sh script to install Score-P.
+export PATH=/projappl/project_462001358/scorep/bin:${PATH}
+
 python -m pip install \
     pybind11 \
     scikit-build-core \

@@ -1,6 +1,51 @@
-# Profiling
+# Profiling with Score-P
 
-TODO rewrite after installing Score-P & testing this
+## Preprocessing
+
+Score-P does not understand the `.c++` extension used by runko.
+To instrument with Score-P, the extensions have to be changed
+to a more common extension, e.g. `.cpp`.
+
+It takes some manual fiddling, but here are helpful scripts.
+
+Run this in the runko repository to get a list of source files that
+refer to `.c++`:
+```bash
+grep -rI "\.c++" | awk -F: '{print $1}' | sort | uniq
+```
+
+It may produce something like
+```
+docs/Doxyfile.in
+external/corgi/examples/game-of-life/CMakeLists.txt
+external/corgi/examples/particles/CMakeLists.txt
+external/corgi/mpi4cpp/test/CMakeLists.txt
+external/corgi/pycorgi/CMakeLists.txt
+external/corgi/tests/CMakeLists.txt
+external/corgi/viesti/makefile
+external/corgi/viesti/viesti.c++
+external/tyvi/test/CMakeLists.txt
+profiling/build_scorep_old.sh
+profiling/scorep/README.md
+prototypes/cpp-pic/Doxyfile
+prototypes/sparse-vlasov-mesh/velomesh.h
+src/CMakeLists.txt
+src/runko/pic/reflector_wall.c++
+tests/cpp/CMakeLists.txt
+```
+
+We'll remove some of those by hand to get the ones
+that are used for building runko
+(note that this list may change):
+```
+external/corgi/pycorgi/CMakeLists.txt
+external/corgi/viesti/makefile
+external/corgi/viesti/viesti.c++
+src/CMakeLists.txt
+```
+
+
+
 
 ## Installing and setup
 

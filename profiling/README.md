@@ -3,8 +3,15 @@
 ## Installing dependencies
 
 First install the dependencies with the `install_dependencies.sh` script.
-This installs Score-P for instrumenting the C++ code and `viztracer` and `scorep` python packages
-in addition to the rest of the python dependencies. Run it on a compute node: `sbatch install_dependencies.sh`.
+This installs `viztracer` and `scorep` python packages in addition to
+the rest of the python dependencies.
+Run it on a compute node: `sbatch install_dependencies.sh`.
+
+Note that the `scorep` python package requires an installed Score-P:
+specifically `scorep-config` should be in `PATH`. There's the `install_scorep.sh`,
+which can be used to install Score-P, if it's not already installed. See it for more info.
+If you don't have a Score-P installation available,
+install it before running `install_dependencies.sh`.
 
 ## Build
 

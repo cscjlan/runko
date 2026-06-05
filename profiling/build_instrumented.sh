@@ -29,9 +29,25 @@ fi
 
 cd ${RUNKODIR}
 
-# We assume here that dependencies have already been installed to the virtual environment
+# Dependencies should be installed to the virtual environment
+# before building runko, including scorep.
 source venv/bin/activate
 
-# TODO need to use Score-P to instrument the files
-pip install --no-build-isolation -v -e ${RUNKODIR} \
-      --config-settings=cmake.args=--preset=lumi-gpu
+# Which programming paradigms to measure
+# This file sets PARADIGMS_USED
+source ${RUNKODIR}/profiling/scorep/scorep-paradigms.sh
+
+export SCOREP_WRAPPER_INSTRUMENTER_FLAGS=""
+export SCOREP_WRAPPER_INSTRUMENTER_FLAGS="${SCOREP_WRAPPER_INSTRUMENTER_FLAGS} --verbose=2"
+export SCOREP_WRAPPER_INSTRUMENTER_FLAGS="${SCOREP_WRAPPER_INSTRUMENTER_FLAGS} ${PARADIGMS_USED}"
+
+# TODO Check that this matches the new build procedure
+SCOREP_WRAPPER=off \
+cmake \
+    -B build \
+    -S . \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_CXX_COMPILER=scorep-CC \
+    -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
+
+cmake --build build --target runko_cpp_bindings -j 16
