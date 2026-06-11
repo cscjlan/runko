@@ -23,14 +23,14 @@ if __name__ == "__main__":
     config = runko.Configuration(None)
 
     config.outdir = "turb-small"
-    config.Nx = 2
-    config.Ny = 2
-    config.Nz = 2
+    config.Nx = 1
+    config.Ny = 1
+    config.Nz = 1
     config.NxMesh = 128
     config.NyMesh = 128
     config.NzMesh = 128
     config.cfl = 0.45
-    config.Nt = 20
+    config.Nt = 1
     config.xmin = 0
     config.ymin = 0
     config.zmin = 0
@@ -46,7 +46,7 @@ if __name__ == "__main__":
 
 
     # Problem specific configuration
-    ppc = 2 # particles per cell (one particle type)
+    ppc = 64 # particles per cell (one particle type)
     oppc = 2 * ppc # overall particles per cell (all particle types)
     gamma = 1
     c_omp = 1

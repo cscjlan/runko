@@ -18,7 +18,6 @@ module load craype-accel-amd-gfx90a
 module load cray-mpich/9.0.1
 module load craype-network-ofi
 module load buildtools
-module load cray-python
 module load lumi-CrayPath
 
 if [ ! -d ${RUNKODIR} ]
@@ -33,6 +32,9 @@ cd ${RUNKODIR}
 # before building runko, including scorep.
 source venv/bin/activate
 
+# Add installed Score-P to PATH
+export PATH=/projappl/project_462001358/scorep/bin:${PATH}
+
 # Which programming paradigms to measure
 # This file sets PARADIGMS_USED
 source ${RUNKODIR}/profiling/scorep/scorep-paradigms.sh
@@ -41,13 +43,14 @@ export SCOREP_WRAPPER_INSTRUMENTER_FLAGS=""
 export SCOREP_WRAPPER_INSTRUMENTER_FLAGS="${SCOREP_WRAPPER_INSTRUMENTER_FLAGS} --verbose=2"
 export SCOREP_WRAPPER_INSTRUMENTER_FLAGS="${SCOREP_WRAPPER_INSTRUMENTER_FLAGS} ${PARADIGMS_USED}"
 
-# TODO Check that this matches the new build procedure
+INSTRUMENTED_BUILD_DIR=build-instrumented
+
 SCOREP_WRAPPER=off \
 cmake \
-    -B build \
+    --preset=lumi-gpu \
+    -B $INSTRUMENTED_BUILD_DIR \
     -S . \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_CXX_COMPILER=scorep-CC \
     -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
 
-cmake --build build --target runko_cpp_bindings -j 16
+cmake --build $INSTRUMENTED_BUILD_DIR

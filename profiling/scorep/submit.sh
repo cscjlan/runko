@@ -4,8 +4,8 @@
 #SBATCH --partition=standard-g
 #SBATCH --job-name=runko-scorep
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=8
-#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem-per-cpu=8GB
 #SBATCH --time=0-03:00:00       # Run time (d-hh:mm:ss)
@@ -18,8 +18,8 @@ module load craype-accel-amd-gfx90a
 module load cray-mpich/9.0.1
 module load craype-network-ofi
 module load buildtools
-module load cray-python
 module load lumi-CrayPath
+
 
 if [ ! -d ${RUNKODIR} ]
 then
@@ -28,6 +28,12 @@ then
 fi
 
 source ${RUNKODIR}/venv/bin/activate
+
+# Add installed Score-P to PATH after venv activation
+export PATH=/projappl/project_462001358/scorep/bin:${PATH}
+
+# TODO: a robust way for python to use the shared library from the specific directory,
+# not site-packages
 
 export RUNKO_RUNDIR=/tmp/$USER/scorep
 
@@ -81,7 +87,7 @@ source ${RUNKODIR}/profiling/scorep/scorep-paradigms.sh
 
 export SCOREP_EXPERIMENT_DIRECTORY=${OUTPUT_DIR}
 export SCOREP_PROFILING_MAX_CALLPATH_DEPTH=110
-export SCOREP_FILTERING_FILE=${RUNKODIR}/profiling/scorep.filter
+#export SCOREP_FILTERING_FILE=${RUNKODIR}/profiling/scorep/scorep.filter
 #export SCOREP_METRIC_PAPI=PAPI_FP_OPS,PAPI_L2_TCM
 export SCOREP_MPI_ENABLE_GROUPS=DEFAULT
 export SCOREP_HIP_ENABLE=api,kernel,kernel_callsite,malloc,memcpy,sync,default
@@ -93,7 +99,8 @@ PYTHON_SCOREP="python -m scorep"
 PYTHON_SCOREP="${PYTHON_SCOREP} --instrumenter-type=${PYTHON_SCOREP_INSTRUMENTER_TYPE}"
 PYTHON_SCOREP="${PYTHON_SCOREP} ${PARADIGMS_USED}"
 
-srun --cpu-bind=${CPU_BIND} ./select_gpu ${PYTHON_SCOREP} pic.py
+#srun --cpu-bind=${CPU_BIND} ./select_gpu ${PYTHON_SCOREP} pic.py
+srun ${PYTHON_SCOREP} pic.py
 
 rm -f ./select_gpu
 cd
