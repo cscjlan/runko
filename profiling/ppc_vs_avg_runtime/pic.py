@@ -50,6 +50,11 @@ if __name__ == "__main__":
     gamma = 1
     c_omp = 1
     omp = config.cfl / c_omp
+    config.prealloc_per_species = (ppc
+                                   * config.NxMesh
+                                   * config.NyMesh
+                                   * config.NzMesh)
+    
 
     config.q0 = -gamma * (omp**2.0) / (0.5 * oppc * (1.0 + config.m0 / config.m1))
     config.q1 = abs(config.q0)
