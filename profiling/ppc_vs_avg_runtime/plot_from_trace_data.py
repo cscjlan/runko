@@ -50,6 +50,7 @@ for ppc in ppcs:
 names_of_interest = [
     "grid_push_half_b",
     "comm_external",
+    "prtcl_sort",
     "prtcl_push",
     "prtcl_pack_outgoing",
     "prtcl_deposit_current",
@@ -66,7 +67,7 @@ f = plt.figure(figsize=(32, 18), dpi=120)
 plt.rcParams["axes.prop_cycle"] = cycler(color=color_sequences["tab20"])
 ax = f.add_subplot(111)
 ax.set_xscale("log", base=2)
-ax.set_yscale("log", base=10)
+ax.set_yscale("log", base=2)
 plt.subplots_adjust(
     left=0.095, right=0.9985, top=0.995, bottom=0.135, wspace=0.2, hspace=0.2
 )
@@ -84,7 +85,11 @@ for name, per_pid_timings in timings.items():
 
     x = np.array([int(i) for i in fn_avgs.keys()])
     y = np.array([np.average(durations) for durations in fn_avgs.values()])
-    ax.plot(x, y, "-o", lw=3.0, ms=16.0, label=name)
+    if not name.startswith("comm_"):
+        std = np.array([np.std(durations) for durations in fn_avgs.values()])
+    else:
+        std = np.zeros_like(y)
+    ax.errorbar(x, y, yerr=std, linestyle="-", marker="o", lw=3.0, ms=16.0, label=name)
 
 ax.tick_params(
     axis="both",
