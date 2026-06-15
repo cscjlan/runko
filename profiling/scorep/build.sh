@@ -10,15 +10,17 @@
 #SBATCH --mem-per-cpu=8GB
 #SBATCH --time=00:20:00
 
-module load LUMI/25.09
-module load partition/G
-module load PrgEnv-cray
-module load rocm/6.4.4
-module load craype-accel-amd-gfx90a
-module load cray-mpich/9.0.1
-module load craype-network-ofi
-module load buildtools
-module load lumi-CrayPath
+ml LUMI/25.03
+ml partition/G
+ml PrgEnv-cray
+ml rocm/6.3.4
+ml craype-accel-amd-gfx90a
+ml cray-mpich/8.1.32
+ml craype-network-ofi
+ml buildtools
+
+# From EB
+ml Score-P/9.4-cpeCray-25.03-rocm
 
 if [ ! -d ${RUNKODIR} ]
 then
@@ -31,9 +33,6 @@ cd ${RUNKODIR}
 # Dependencies should be installed to the virtual environment
 # before building runko, including scorep.
 source venv/bin/activate
-
-# Add installed Score-P to PATH
-export PATH=/projappl/project_462001358/scorep/bin:${PATH}
 
 # Which programming paradigms to measure
 # This file sets PARADIGMS_USED
@@ -50,7 +49,9 @@ cmake \
     --preset=lumi-gpu \
     -B $INSTRUMENTED_BUILD_DIR \
     -S . \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_CXX_COMPILER=scorep-CC \
+    -DCMAKE_NO_SYSTEM_FROM_IMPORTED:BOOL=ON \
     -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
 
-cmake --build $INSTRUMENTED_BUILD_DIR
+cmake --build $INSTRUMENTED_BUILD_DIR -j 56

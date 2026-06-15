@@ -9,6 +9,7 @@ import runko
 import numpy as np
 import itertools
 import logging
+import scorep
 
 
 if __name__ == "__main__":
@@ -51,6 +52,11 @@ if __name__ == "__main__":
     gamma = 1
     c_omp = 1
     omp = config.cfl / c_omp
+    config.prealloc_per_species = (ppc
+                                   * config.NxMesh
+                                   * config.NyMesh
+                                   * config.NzMesh)
+    
 
     config.q0 = -gamma * (omp**2.0) / (0.5 * oppc * (1.0 + config.m0 / config.m1))
     config.q1 = abs(config.q0)
@@ -170,17 +176,18 @@ if __name__ == "__main__":
     tile_grid = runko.TileGrid(config)
 
     if not tile_grid.initialized_from_restart_file():
-        for idx in tile_grid.local_tile_indices():
-            tile = runko.pic.threeD.Tile(idx, config)
-            tile.batch_set_EBJ(zero_field, zero_field, zero_field,
-                               Bx, By, Bz,
-                               zero_field, zero_field, zero_field)
-            for _ in range(ppc):
-                runko.runko_logger().info("Injecting particles of type 0...")
-                tile.batch_inject_to_cells(0, pgen0)
-                runko.runko_logger().info("Injecting particles of type 1...")
-                tile.batch_inject_to_cells(1, pgen1)
-            tile_grid.add_tile(tile, idx)
+        with scorep.instrumenter.enable():
+            for idx in tile_grid.local_tile_indices():
+                tile = runko.pic.threeD.Tile(idx, config)
+                tile.batch_set_EBJ(zero_field, zero_field, zero_field,
+                                   Bx, By, Bz,
+                                   zero_field, zero_field, zero_field)
+                for _ in range(ppc):
+                    runko.runko_logger().info("Injecting particles of type 0...")
+                    tile.batch_inject_to_cells(0, pgen0)
+                    runko.runko_logger().info("Injecting particles of type 1...")
+                    tile.batch_inject_to_cells(1, pgen1)
+                tile_grid.add_tile(tile,idx)
 
     # Initializes the simulation and returns a handle to it:
     simulation = tile_grid.configure_simulation(config)

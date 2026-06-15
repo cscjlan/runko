@@ -10,16 +10,17 @@
 #SBATCH --mem-per-cpu=8GB
 #SBATCH --time=0-03:00:00       # Run time (d-hh:mm:ss)
 
-module load LUMI/25.09
-module load partition/G
-module load PrgEnv-cray
-module load rocm/6.4.4
-module load craype-accel-amd-gfx90a
-module load cray-mpich/9.0.1
-module load craype-network-ofi
-module load buildtools
-module load lumi-CrayPath
+ml LUMI/25.03
+ml partition/G
+ml PrgEnv-cray
+ml rocm/6.3.4
+ml craype-accel-amd-gfx90a
+ml cray-mpich/8.1.32
+ml craype-network-ofi
+ml buildtools
 
+# From EB
+ml Score-P/9.4-cpeCray-25.03-rocm
 
 if [ ! -d ${RUNKODIR} ]
 then
@@ -28,12 +29,6 @@ then
 fi
 
 source ${RUNKODIR}/venv/bin/activate
-
-# Add installed Score-P to PATH after venv activation
-export PATH=/projappl/project_462001358/scorep/bin:${PATH}
-
-# TODO: a robust way for python to use the shared library from the specific directory,
-# not site-packages
 
 export RUNKO_RUNDIR=/tmp/$USER/scorep
 
@@ -86,17 +81,23 @@ fi
 source ${RUNKODIR}/profiling/scorep/scorep-paradigms.sh
 
 export SCOREP_EXPERIMENT_DIRECTORY=${OUTPUT_DIR}
-export SCOREP_PROFILING_MAX_CALLPATH_DEPTH=110
+export SCOREP_PROFILING_MAX_CALLPATH_DEPTH=10654
 #export SCOREP_FILTERING_FILE=${RUNKODIR}/profiling/scorep/scorep.filter
 #export SCOREP_METRIC_PAPI=PAPI_FP_OPS,PAPI_L2_TCM
 export SCOREP_MPI_ENABLE_GROUPS=DEFAULT
 export SCOREP_HIP_ENABLE=api,kernel,kernel_callsite,malloc,memcpy,sync,default
 export SCOREP_HIP_ACTIVITY_BUFFER_SIZE=16M
 export SCOREP_TOTAL_MEMORY=4000MB
+#export SCOREP_MEMORY_RECORDING=true
+#export SCOREP_VERBOSE=true
+
+# Sampling
+export SCOREP_ENABLE_UNWINDING=true
+export SCOREP_SAMPLING_EVENTS= #perf_cycles@1000000
 
 PYTHON_SCOREP="python -m scorep"
-#PYTHON_SCOREP="${PYTHON_SCOREP} --noinstrumenter"
-PYTHON_SCOREP="${PYTHON_SCOREP} --instrumenter-type=${PYTHON_SCOREP_INSTRUMENTER_TYPE}"
+PYTHON_SCOREP="${PYTHON_SCOREP} --noinstrumenter"
+#PYTHON_SCOREP="${PYTHON_SCOREP} --instrumenter-type=${PYTHON_SCOREP_INSTRUMENTER_TYPE}"
 PYTHON_SCOREP="${PYTHON_SCOREP} ${PARADIGMS_USED}"
 
 #srun --cpu-bind=${CPU_BIND} ./select_gpu ${PYTHON_SCOREP} pic.py
