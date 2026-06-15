@@ -10,16 +10,18 @@
 #SBATCH --mem-per-cpu=8GB
 #SBATCH --time=00:20:00
 
-ml LUMI/25.09
+ml LUMI/25.03
 ml partition/G
 ml PrgEnv-cray
-ml rocm/6.4.4
+ml rocm/6.3.4
 ml craype-accel-amd-gfx90a
-ml cray-mpich/9.0.1
+ml cray-mpich/8.1.32
 ml craype-network-ofi
 ml buildtools
 ml cray-python
-ml lumi-CrayPath
+
+# From EB
+ml Score-P/9.4-cpeCray-25.03-rocm
 
 if [ ! -d ${RUNKODIR} ]
 then
@@ -38,4 +40,5 @@ MPI4PY_BUILD_MPICC=cc python -m pip install --no-cache-dir --no-binary=mpi4py mp
 python -m pip install \
     pybind11 \
     scikit-build-core \
-    viztracer
+    viztracer \
+    scorep

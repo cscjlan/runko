@@ -10,16 +10,14 @@
 #SBATCH --mem-per-cpu=8GB
 #SBATCH --time=00:20:00
 
-ml LUMI/25.09
-ml partition/G
-ml PrgEnv-cray
-ml rocm/6.4.4
-ml craype-accel-amd-gfx90a
-ml cray-mpich/9.0.1
-ml craype-network-ofi
-ml buildtools
-ml cray-python
-ml lumi-CrayPath
+module load LUMI/25.03
+module load partition/G
+module load PrgEnv-cray
+module load rocm/6.3.4
+module load craype-accel-amd-gfx90a
+module load cray-mpich/8.1.32
+module load craype-network-ofi
+module load buildtools
 
 if [ ! -d ${RUNKODIR} ]
 then
@@ -29,13 +27,8 @@ fi
 
 cd ${RUNKODIR}
 
-python -m venv venv
-
+# We assume here that dependencies have already been installed to the virtual environment
 source venv/bin/activate
 
-MPI4PY_BUILD_MPICC=cc python -m pip install --no-cache-dir --no-binary=mpi4py mpi4py
-
-python -m pip install \
-    pybind11 \
-    scikit-build-core \
-    viztracer
+pip install --no-build-isolation -v -e ${RUNKODIR} \
+      --config-settings=cmake.args=--preset=lumi-gpu
