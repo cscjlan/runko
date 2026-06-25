@@ -18,7 +18,6 @@ module load craype-accel-amd-gfx90a
 module load cray-mpich/9.0.1
 module load craype-network-ofi
 module load buildtools
-module load cray-python
 module load lumi-CrayPath
 
 if [ ! -d ${RUNKODIR} ]
