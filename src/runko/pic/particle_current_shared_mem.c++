@@ -21,6 +21,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #if defined(TYVI_BACKEND_HIP)
@@ -46,17 +47,10 @@ INLINE DEVICE void
 }
 
 template<typename T, typename I>
-INLINE DEVICE std::uint32_t
+INLINE DEVICE T
   shfl_down(T a, I src)
 {
   return __shfl_down(a, src);
-}
-
-template<typename T>
-INLINE DEVICE T
-  atomic_add(T* a, T b)
-{
-  return atomicAdd(a, b);
 }
 
 INLINE DEVICE std::uint32_t
@@ -120,15 +114,6 @@ INLINE DEVICE std::uint32_t
   return a;
 }
 
-template<typename T>
-INLINE DEVICE T
-  atomic_add(T* a, T b)
-{
-  const auto old = *a;
-  *a += b;
-  return old;
-}
-
 INLINE DEVICE std::uint32_t
   gdim()
 {
@@ -152,6 +137,7 @@ INLINE DEVICE std::uint32_t
 {
   return bdim() / wsz();
 }
+
 INLINE DEVICE std::uint32_t
   bid()
 {
@@ -180,29 +166,25 @@ INLINE DEVICE std::uint32_t
 
 namespace pic {
 using Vec3i = toolbox::Vec3<std::uint32_t>;
-template<typename T>
-using Vec3 = toolbox::Vec3<T>;
 
 template<typename T, typename F>
 INLINE DEVICE T
   warp_reduce(T t, F f)
 {
 #pragma unroll
-  for(auto src_lane = detail::wsz() / 2u; src_lane >= 1; src_lane /= 2u) {
+  for(auto src_lane = detail::wsz() / 2u; src_lane >= 1u; src_lane /= 2u) {
     t = f(t, detail::shfl_down(t, src_lane));
   }
 
   return t;
 }
 
-template<typename value_type>
+// This assumes cells can never be negative
 struct Box {
-  using Vec3v = Vec3<value_type>;
+  Vec3i min = { ~0u };
+  Vec3i max = { 0u };
 
-  Vec3v min = { std::numeric_limits<value_type>::max() };
-  Vec3v max = { std::numeric_limits<value_type>::min() };
-
-  DEVICE bool contains(const Vec3v& point) const
+  DEVICE INLINE bool contains(const Vec3i& point) const
   {
     bool contained = true;
 #pragma unroll
@@ -213,21 +195,18 @@ struct Box {
     return contained;
   }
 
-  DEVICE Vec3v extent() const { return max - min; }
-
-  DEVICE value_type volume() const
-  {
-    const auto ext = extent();
-    return ext.x * ext.y * ext.z;
-  }
-
-  DEVICE value_type volume(const Vec3v& ext) const { return ext.x * ext.y * ext.z; }
+  DEVICE INLINE Vec3i extent() const { return max - min; }
 };
 
+std::uint32_t
+  volume(const Vec3i& v)
+{
+  return v.x * v.y * v.z;
+}
+
 template<typename value_type>
-Box<value_type>
+DEVICE INLINE Box
   make_bounding_box(
-    std::uint32_t particle_offset,
     const value_type cfl,
     const std::array<value_type, 3> lattice_origo_coordinates,
     std::span<runko::prtc_id_type> ids_span,
@@ -235,41 +214,35 @@ Box<value_type>
     std::span<value_type> pos_span,
     std::span<value_type> scratch)
 {
-  Box<value_type> box;
+  using Vec3v = toolbox::Vec3<value_type>;
+  Box box;
   // First we loop over the amount of particles we want to consider for the
   // bounding box. Each thread keeps a tally of the minimum and maximum for each axis.
-  for(auto elem_idx = detail::tid(); elem_idx < detail::bdim();
+  for(auto elem_idx = detail::tid(); elem_idx < ids_span.size();
       elem_idx += detail::bdim()) {
-    const auto particle_idx = particle_offset + elem_idx;
-    if(ids_span[particle_idx] == runko::dead_prtc_id) { continue; }
+    if(ids_span[elem_idx] == runko::dead_prtc_id) { continue; }
 
-    const auto u = Vec3<value_type>(vel_span[particle_idx]).template as<value_type>();
+    const auto u = Vec3v(vel_span[elem_idx]);
     const auto invgam =
       value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
-
-    const auto x2 =
-      Vec3<value_type>(pos_span[particle_idx]).template as<value_type>() -
-      Vec3<value_type>(lattice_origo_coordinates).template as<value_type>();
-
+    const auto x2 = Vec3v(pos_span[elem_idx]) - Vec3v(lattice_origo_coordinates);
     const auto x1 = x2 - cfl * invgam * u;
-    const auto fi1 =
-      Vec3<value_type>(sstd::floor(x1(0)), sstd::floor(x1(1)), sstd::floor(x1(2)));
-    const auto fi2 =
-      Vec3<value_type>(sstd::floor(x2(0)), sstd::floor(x2(1)), sstd::floor(x2(2)));
+    const auto i1 = x1.template as<std::uint32_t>();
+    const auto i2 = x2.template as<std::uint32_t>();
 
 #pragma unroll
     for(auto i = 0u; i < 3; i++) {
-      box.min[i] = std::min(box.min[i], std::min(fi1[i], fi2[i]));
-      box.max[i] = std::max(box.max[i], std::max(fi1[i], fi2[i]));
+      box.min[i] = sstd::min(box.min[i], sstd::min(i1[i], i2[i]));
+      box.max[i] = sstd::max(box.max[i], sstd::max(i1[i], i2[i]));
     }
   }
 
-  // Next we do a warp reduction over the bounds: after this, threads on lane == 0
+  // Next we do a warp reduction over the bounds: after this, threads with lane id == 0
   // will have the bounds from its warp
 #pragma unroll
   for(auto i = 0u; i < 3u; i++) {
-    box.min[i] = warp_reduce(box.min[i], std::min<value_type>);
-    box.max[i] = warp_reduce(box.max[i], std::max<value_type>);
+    box.min[i] = warp_reduce(box.min[i], sstd::min<std::uint32_t>);
+    box.max[i] = warp_reduce(box.max[i], sstd::max<std::uint32_t>);
   }
 
   // If you're lane 0, store the six different values to scratch memory
@@ -298,7 +271,7 @@ Box<value_type>
       val = scratch[detail::lid() + i * detail::num_warps()];
     }
     // First three warps do the minimum bounds, the other three max
-    const auto* f = i < 3u ? std::min<value_type> : std::max<value_type>;
+    const auto* f = i < 3u ? sstd::min<value_type> : sstd::max<value_type>;
 
     // Not a warp-wide reduction, only however many warps we have in the block
     // (e.g. 16 for a block of 1024 threads)
@@ -327,19 +300,19 @@ Box<value_type>
   // and another 1, because we'll be adding current to neighbour cells in the
   // positive directions. Thus, the minimum possible size for the box is
   // (2, 2, 2), if all particles are in the same cell.
-  box.max += Vec3<value_type> { 2 };
+  box.max += Vec3v { 2 };
   auto extent = box.extent();
-  auto volume = box.volume(extent);
+  auto vol    = volume(extent);
 
   // If the entire box doesn't fit into the available scratch memory, we must
   // reduce the size of the box. This could be improved, now it just reduces the
   // largest dimension by one, until the box fits. We must multiply the volume by
   // three, as we'll be saving a vector of currents.
-  while(scratch.size() < 3u * volume) {
+  while(scratch.size() < 3u * vol) {
     const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
                                            : (extent[1u] > extent[2u] ? 1u : 2u);
-    extent[i] -= value_type { 1 };
-    volume = box.volume(extent);
+    extent[i] -= 1u;
+    vol = volume(extent);
   }
 
   // The new maximum is minimum + the (possibly) reduced extent.
@@ -350,6 +323,14 @@ Box<value_type>
   return box;
 }
 
+// TODO instead of the chunk loop here,
+// actually use spans.
+// Maybe the chunks can be computed on the host?
+// Then we just have e.g. spans of spans. Dunno.
+// Anyway, this function can be turned into a kernel,
+// then have another function which does what this does inside
+// the first loop. That one takes spans, which we create from the chunk sizes
+// here
 template<typename value_type, typename MDS>
 DEVICE void
   deposit_current(
@@ -364,17 +345,23 @@ DEVICE void
     const std::array<value_type, 3> lattice_origo_coordinates,
     std::span<value_type> scratch)
 {
+  // 2x2x2 box of Vec3 is the absolute minimum.
+  // It won't be efficient, but it's possible.
+  assert(scratch.size() >= 24ul);
+
+  using Vec3v = toolbox::Vec3<value_type>;
   for(auto chunk_idx = detail::bid(); chunk_idx < num_chunks;
       chunk_idx += detail::gdim()) {
     const auto particle_offset = chunk_idx * chunk_size;
 
-    const auto box = make_bounding_box(
-      particle_offset,
+    // Make subspans for the box size computation.
+    const auto count = sstd::min(detail::bdim(), chunk_size);
+    const auto box   = make_bounding_box(
       cfl,
       lattice_origo_coordinates,
-      ids_span,
-      vel_span,
-      pos_span,
+      ids_span.subspan(particle_offset, count),
+      pos_span.subspan(particle_offset, count),
+      vel_span.subspan(particle_offset, count),
       scratch);
 
     for(auto i = detail::tid(); i < scratch.size(); i += detail::bdim()) {
@@ -383,50 +370,48 @@ DEVICE void
 
     detail::syncthreads();
 
-    const auto store_current =
-      [&](const Vec3i& point, const Vec3<value_type>& current) {
-        if(box.contains(point)) {
-          const auto delta  = point - box.min;
-          const auto extent = box.extent();
-          const auto volume = box.volume(extent);
-          const auto idx = delta.z + delta.y * extent.z + delta.x * extent.y * extent.z;
+    const auto extent        = box.extent();
+    const auto vol           = volume(extent);
+    const auto store_current = [&](const Vec3i& point, const Vec3v& current) {
+      if(box.contains(point)) {
+        const auto delta = point - box.min;
+        const auto idx   = delta.z + delta.y * extent.z + delta.x * extent.y * extent.z;
 #pragma unroll
-          for(auto i = 0u; i < 3u; i++) {
-            detail::atomic_add(&scratch[idx + i * volume], current[i]);
-          }
-        } else {
-          const auto si  = point.template as<runko::index_t>();
-          auto* const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
-          auto* const Jy = &thrust::raw_reference_cast(Jmds[si.data][1]);
-          auto* const Jz = &thrust::raw_reference_cast(Jmds[si.data][2]);
-
-          detail::atomic_add(Jx, current[0]);
-          detail::atomic_add(Jy, current[1]);
-          detail::atomic_add(Jz, current[2]);
+        for(auto i = 0u; i < 3u; i++) {
+          sstd::atomic_add(&scratch[idx + i * vol], current[i]);
         }
-      };
+      } else {
+        const auto si  = point.template as<runko::index_t>();
+        auto* const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
+        auto* const Jy = &thrust::raw_reference_cast(Jmds[si.data][1]);
+        auto* const Jz = &thrust::raw_reference_cast(Jmds[si.data][2]);
+
+        sstd::atomic_add(Jx, current[0]);
+        sstd::atomic_add(Jy, current[1]);
+        sstd::atomic_add(Jz, current[2]);
+      }
+    };
 
     for(auto elem_idx = detail::tid(); elem_idx < chunk_size;
         elem_idx += detail::bdim()) {
       const auto particle_idx = particle_offset + elem_idx;
       if(ids_span[particle_idx] == runko::dead_prtc_id) { continue; }
 
-      const auto u = Vec3<value_type>(vel_span[particle_idx]).template as<value_type>();
+      const auto u = Vec3v(vel_span[particle_idx]).template as<value_type>();
       const auto invgam =
         value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
 
-      const auto x2 =
-        Vec3<value_type>(pos_span[particle_idx]).template as<value_type>() -
-        Vec3<value_type>(lattice_origo_coordinates).template as<value_type>();
+      const auto x2 = Vec3v(pos_span[particle_idx]).template as<value_type>() -
+                      Vec3v(lattice_origo_coordinates).template as<value_type>();
 
       const auto x1 = x2 - cfl * invgam * u;
 
       // Float floor for relay and weight computation (pure float — no 64-bit
       // integers)
       const auto fi1 =
-        Vec3<value_type>(sstd::floor(x1(0)), sstd::floor(x1(1)), sstd::floor(x1(2)));
+        Vec3v(sstd::floor(x1(0)), sstd::floor(x1(1)), sstd::floor(x1(2)));
       const auto fi2 =
-        Vec3<value_type>(sstd::floor(x2(0)), sstd::floor(x2(1)), sstd::floor(x2(2)));
+        Vec3v(sstd::floor(x2(0)), sstd::floor(x2(1)), sstd::floor(x2(2)));
 
       const auto relay = [&](const runko::index_t j) -> value_type {
         const auto a  = sstd::min(fi1(j), fi2(j)) + value_type { 1 };
@@ -436,7 +421,7 @@ DEVICE void
         return sstd::min(a, b);
       };
 
-      const auto x_relay = Vec3<value_type>(relay(0), relay(1), relay(2));
+      const auto x_relay = Vec3v(relay(0), relay(1), relay(2));
 
       const auto F1 = charge * (x_relay - x1);
       const auto F2 = charge * (x2 - x_relay);
@@ -456,49 +441,46 @@ DEVICE void
 
       store_current(
         i1,
-        Vec3<value_type>(
+        Vec3v(
           Fx1 * (one - Wy1) * (one - Wz1),
           Fy1 * (one - Wx1) * (one - Wz1),
           Fz1 * (one - Wx1) * (one - Wy1)));
 
       store_current(
         i2,
-        Vec3<value_type>(
+        Vec3v(
           Fx2 * (one - Wy2) * (one - Wz2),
           Fy2 * (one - Wx2) * (one - Wz2),
           Fz2 * (one - Wx2) * (one - Wy2)));
       store_current(
         i1 + Vec3i(1, 0, 0),
-        Vec3<value_type>(0, Fy1 * Wx1 * (one - Wz1), Fz1 * Wx1 * (one - Wy1)));
+        Vec3v(0, Fy1 * Wx1 * (one - Wz1), Fz1 * Wx1 * (one - Wy1)));
       store_current(
         i2 + Vec3i(1, 0, 0),
-        Vec3<value_type>(0, Fy2 * Wx2 * (one - Wz2), Fz2 * Wx2 * (one - Wy2)));
+        Vec3v(0, Fy2 * Wx2 * (one - Wz2), Fz2 * Wx2 * (one - Wy2)));
       store_current(
         i1 + Vec3i(0, 1, 0),
-        Vec3<value_type>(Fx1 * Wy1 * (one - Wz1), 0, Fz1 * (one - Wx1) * Wy1));
+        Vec3v(Fx1 * Wy1 * (one - Wz1), 0, Fz1 * (one - Wx1) * Wy1));
       store_current(
         i2 + Vec3i(0, 1, 0),
-        Vec3<value_type>(Fx2 * Wy2 * (one - Wz2), 0, Fz2 * (one - Wx2) * Wy2));
+        Vec3v(Fx2 * Wy2 * (one - Wz2), 0, Fz2 * (one - Wx2) * Wy2));
       store_current(
         i1 + Vec3i(0, 0, 1),
-        Vec3<value_type>(Fx1 * (one - Wy1) * Wz1, Fy1 * (one - Wx1) * Wz1, 0));
+        Vec3v(Fx1 * (one - Wy1) * Wz1, Fy1 * (one - Wx1) * Wz1, 0));
       store_current(
         i2 + Vec3i(0, 0, 1),
-        Vec3<value_type>(Fx2 * (one - Wy2) * Wz2, Fy2 * (one - Wx2) * Wz2, 0));
-      store_current(i1 + Vec3i(0, 1, 1), Vec3<value_type>(Fx1 * Wy1 * Wz1, 0, 0));
-      store_current(i2 + Vec3i(0, 1, 1), Vec3<value_type>(Fx2 * Wy2 * Wz2, 0, 0));
-      store_current(i1 + Vec3i(1, 0, 1), Vec3<value_type>(0, Fy1 * Wx1 * Wz1, 0));
-      store_current(i2 + Vec3i(1, 0, 1), Vec3<value_type>(0, Fy2 * Wx2 * Wz2, 0));
-      store_current(i1 + Vec3i(1, 1, 0), Vec3<value_type>(0, 0, Fz1 * Wx1 * Wy1));
-      store_current(i2 + Vec3i(1, 1, 0), Vec3<value_type>(0, 0, Fz2 * Wx2 * Wy2));
+        Vec3v(Fx2 * (one - Wy2) * Wz2, Fy2 * (one - Wx2) * Wz2, 0));
+      store_current(i1 + Vec3i(0, 1, 1), Vec3v(Fx1 * Wy1 * Wz1, 0, 0));
+      store_current(i2 + Vec3i(0, 1, 1), Vec3v(Fx2 * Wy2 * Wz2, 0, 0));
+      store_current(i1 + Vec3i(1, 0, 1), Vec3v(0, Fy1 * Wx1 * Wz1, 0));
+      store_current(i2 + Vec3i(1, 0, 1), Vec3v(0, Fy2 * Wx2 * Wz2, 0));
+      store_current(i1 + Vec3i(1, 1, 0), Vec3v(0, 0, Fz1 * Wx1 * Wy1));
+      store_current(i2 + Vec3i(1, 1, 0), Vec3v(0, 0, Fz2 * Wx2 * Wy2));
     }
 
     detail::syncthreads();
 
-    const auto extent = box.extent();
-    const auto volume = box.volume(extent);
-    for(auto shmem_idx = detail::tid(); shmem_idx < volume;
-        shmem_idx += detail::bdim()) {
+    for(auto shmem_idx = detail::tid(); shmem_idx < vol; shmem_idx += detail::bdim()) {
       const auto si = (Vec3i { shmem_idx / (extent.y * extent.z),
                                (shmem_idx / extent.z) % extent.y,
                                shmem_idx % extent.z } +
@@ -512,8 +494,8 @@ DEVICE void
 
 #pragma unroll
       for(auto i = 0u; i < 3u; i++) {
-        const auto val = scratch[shmem_idx + i * volume];
-        if(0 != val) { detail::atomic_add(J[i], val); }
+        const auto val = scratch[shmem_idx + i * vol];
+        if(0 != val) { sstd::atomic_add(J[i], val); }
       }
     }
 
