@@ -55,23 +55,26 @@
 //    correctly for that type. Test multiple types.
 // 6. Test that warp_reduce correctly reduces for different functions
 //    test multiple binary functions: min, max, add, sub, mul, div and so on
-//    TODO: kirjota nämä ohjeet uusiksi
 // 7. Box:
 //    Assume all points coordinates are non-negative
 //    7.1: Create a box with some min and max and check that `contains`
 //        works correctly for a bunch of points.
-//    7.2: create a box with some min and max and check that `extent` is correct
-//    7.3: `bound_points` should increase the size of the box such that it'll contain
-//         all the points that `bound_points` was called with and any other points
-//         that have coordinate values within the limits of the maximum and minimum
-//         coordinate values of all the points.
-//    7.4: Given a scratch (LDS) that fits at least 96 std::uint32_t values,
-//         check `bound_thread_boxes`. Create a unique box for each thread.
-//         After `bound_thread_boxes` all threads should have the same box:
-//         one box that bounds all the other boxes.
-//    7.5: With max_volume in range [24, 64000/2/8/3] check that `shrink_to_max_volume`
+//    7.2: Use LDS big enough to fit at least 96 std::uint32_t
+//         and test that `bound_thread_boxes` creates a box that bounds
+//         all the (different shapes and sizes of) the boxes that individual threads have
+//    7.3: With max_volume in range [24, 64000/2/8/3] check that `shrink_to_max_volume`
 //         shrinks boxes of different sizes (and shapes!) such that the volume of the
 //         box multiplied by three is then less than the max_volume.
+//    7.4: `clear_current` should clear the current scratch to zero
+//    7.5: Compare `store` to a simpler way to create a histogram of currents:
+//         use e.g. global atomics, and compare those with the values stored
+//         in the shared memory. For this, you should of course create some points,
+//         then create a bounding box, then store some current values
+//         to the box.
+//    7.6: `copy_from_shared_to_global`: create a global memory full of zeros
+//         have some values in the box's shared memory. Call this function,
+//         and check that the values in the global memory are all zero, except
+//         for the once that were stored in the shared memory.
 // 9. Check prod computes the product of a vector correctly
 
 namespace detail {
@@ -228,24 +231,24 @@ INLINE DEVICE T
 }
 
 template<typename T>
-T
+INLINE DEVICE T
   prod(const toolbox::Vec3<T>& v)
 {
-  return v.x * v.y * v.z;
+  return v[0] * v[1] * v[2];
 }
 
 // This assumes cells can never be negative
 template<typename value_type>
 struct Box {
-  Vec3i min                               = { ~0u };
-  Vec3i extent                            = { 0u };
+  Vec3i min                               = { ~0u, ~0u, ~0u };
+  Vec3i extent                            = { 0u, 0u, 0u };
   std::span<value_type> current_scratch   = {};
   std::span<std::uint32_t> bounds_scratch = {};
   std::uint32_t volume                    = 0u;
 
   DEVICE INLINE
     Box(const Vec3i& aabb_min, const Vec3i& aabb_max, std::span<std::byte> scratch) :
-    min(min),
+    min(aabb_min),
     extent(aabb_max - min),
     current_scratch(make_aligned_span<value_type>(scratch)),
     bounds_scratch(make_aligned_span<std::uint32_t>(scratch)),
@@ -304,7 +307,7 @@ struct Box {
       if(detail::lid() < detail::num_warps()) {
         val = bounds_scratch[detail::lid() + i * detail::num_warps()];
       }
-      const auto* f = i < 3u ? sstd::min<std::uint32_t> : sstd::max<std::uint32_t>;
+      const auto f = i < 3u ? sstd::min<std::uint32_t> : sstd::max<std::uint32_t>;
 
       // All lanes participate, but lane 0 only contains reductions from first num_warps
       // lanes.
@@ -345,7 +348,7 @@ struct Box {
     // The other one comes from the stencil operation to the J grid:
     // we'll be adding current to the neighbouring cells in the positive directions,
     // so we'll increase the size in each dimension by one.
-    max += Vec3i { 2u };
+    extent = extent + Vec3i { 2u, 2u, 2u };
     volume = prod(extent);
 
     // We'll be storing three boxes in the same volume, because we'll be storing
@@ -373,7 +376,7 @@ struct Box {
   DEVICE INLINE void store(const Vec3i& point, const toolbox::Vec3<value_type>& current)
   {
     const auto delta = point - min;
-    const auto idx   = delta.z + delta.y * extent.z + delta.x * extent.y * extent.z;
+    const auto idx   = delta[2] + delta[1] * extent[2] + delta[0] * extent[1] * extent[2];
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
       sstd::atomic_add(&current_scratch[idx + i * volume], current[i]);
@@ -385,11 +388,11 @@ struct Box {
   {
     for(auto shmem_idx = detail::tid(); shmem_idx < volume;
         shmem_idx += detail::bdim()) {
-      const auto si = (Vec3i { shmem_idx / (extent.y * extent.z),
-                               (shmem_idx / extent.z) % extent.y,
-                               shmem_idx % extent.z } +
+      const auto si = (Vec3i { shmem_idx / (extent[1] * extent[2]),
+                               (shmem_idx / extent[2]) % extent[1],
+                               shmem_idx % extent[2] } +
                        min)
-                        .template as<runko::index_t>();
+                        .as<runko::index_t>();
       const auto* const J[3] = {
         &thrust::raw_reference_cast(Jmds[si.data][0]),
         &thrust::raw_reference_cast(Jmds[si.data][1]),
@@ -408,7 +411,7 @@ struct Box {
 };
 
 template<typename value_type>
-DEVICE INLINE Box
+DEVICE INLINE Box<value_type>
   make_bounding_box(
     const value_type cfl,
     std::uint32_t max_volume,
@@ -420,8 +423,8 @@ DEVICE INLINE Box
 {
   using Vec3v = toolbox::Vec3<value_type>;
 
-  Vec3i aabb_min = { ~0u };
-  Vec3i aabb_max = { 0u };
+  Vec3i aabb_min = { ~0u, ~0u, ~0u };
+  Vec3i aabb_max = { 0u, 0u, 0u };
   for(auto elem_idx = detail::tid(); elem_idx < ids_span.size();
       elem_idx += detail::bdim()) {
     if(ids_span[elem_idx] == runko::dead_prtc_id) { continue; }
@@ -441,7 +444,7 @@ DEVICE INLINE Box
     }
   }
 
-  Box box(aabb_min, aabb_max, scratch);
+  Box<value_type> box(aabb_min, aabb_max, scratch);
   box.bound_thread_boxes();
   box.shrink_to_max_volume(max_volume);
   box.clear_current();
@@ -466,7 +469,7 @@ DEVICE void
   using Vec3v = toolbox::Vec3<value_type>;
 
   // Make subspans for the box size computation.
-  const auto count = sstd::min(ids_span.size(), num_box_candidates);
+  const auto count = sstd::min(ids_span.size(), static_cast<std::size_t>(num_box_candidates));
   const auto box   = make_bounding_box(
     cfl,
     max_volume,
@@ -594,7 +597,7 @@ GLOBAL void
     MDS Jmds,
     const std::array<value_type, 3> lattice_origo_coordinates)
 {
-  SHARED std::byte scratch[];
+  extern SHARED std::byte scratch[];
 
   // At least a 2x2x2 box of Vec3 must fit into scratch
   // box creation also uses scratch and requires 6 * num_warps * sizeof(std::uint32_t)
