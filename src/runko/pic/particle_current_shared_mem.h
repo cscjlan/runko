@@ -56,25 +56,17 @@
 //    correctly for that type. Test multiple types.
 // 6. Test that warp_reduce correctly reduces for different functions
 //    test multiple binary functions: min, max, add, sub, mul, div and so on
-// 7. Box:
+// 7. Scratch:
+//    - Test all the functions in scratch with different types and different arguments
+// 8. Box:
 //    Assume all points coordinates are non-negative
-//    7.1: Create a box with some min and max and check that `contains`
-//        works correctly for a bunch of points.
-//    7.2: Use LDS big enough to fit at least 96 std::uint32_t
-//         and test that `bound_thread_boxes` creates a box that bounds
-//         all the (different shapes and sizes of) the boxes that individual threads
-//         have
-//    7.4: `clear_scratch` should clear the scratch to zero
-//    7.5: Compare `store` to a simpler way to create a histogram of currents:
-//         use e.g. global atomics, and compare those with the values stored
-//         in the shared memory. For this, you should of course create some points,
-//         then create a bounding box, then store some current values
-//         to the box.
-//    7.6: `copy_from_shared_to_global`: create a global memory full of zeros
-//         have some values in the box's shared memory. Call this function,
-//         and check that the values in the global memory are all zero, except
-//         for the once that were stored in the shared memory.
+//    Test all the functions. Use scratches of different sizes in range [24 * 4, 32000]
+//    bytes.
 // 9. Check prod computes the product of a vector correctly
+// 10. Don't write tests for the three last functions:
+//     - compute_thread_bounds
+//     - deposit_current
+//     - deposit_current_kernel
 
 namespace detail {
 #if defined(TYVI_BACKEND_HIP)
