@@ -71,8 +71,8 @@
 //         After `bound_thread_boxes` all threads should have the same box:
 //         one box that bounds all the other boxes.
 //    7.5: With max_volume in range [24, 64000/2/8/3] check that `shrink_to_max_volume`
-//         shrinks boxes of different sizes (and shapes!) such that the volume of the box
-//         multiplied by three is then less than the max_volume.
+//         shrinks boxes of different sizes (and shapes!) such that the volume of the
+//         box multiplied by three is then less than the max_volume.
 // 9. Check prod computes the product of a vector correctly
 
 namespace detail {
@@ -236,9 +236,16 @@ T
 }
 
 // This assumes cells can never be negative
+template<typename value_type>
 struct Box {
-  Vec3i min = { ~0u };
-  Vec3i max = { 0u };
+  Vec3i min                             = { ~0u };
+  Vec3i max                             = { 0u };
+  std::span<value_type> current_scratch = {};
+
+  DEVICE INLINE Box(std::span<std::byte> scratch) :
+    current_scratch(make_aligned_span<value_type>(scratch))
+  {
+  }
 
   DEVICE INLINE bool contains(const Vec3i& point) const
   {
@@ -332,7 +339,7 @@ struct Box {
     // The box is large enough to bound all the particles.
     // It may be too large to fit into scratch memory, so it may have to
     // be shrunk. We do that here.
-      
+
     // Increase size by two:
     // If all the particles are in the same cell, the min and max bounds are the same.
     // To make the upper bound strictly larger than any of the particle positions,
@@ -354,22 +361,74 @@ struct Box {
     }
 
     max = min + ext;
+    // Resize the span
+    current_scratch = current_scratch.subspan(0u, 3u * volume);
+  }
+
+  DEVICE INLINE void clear_current()
+  {
+    for(auto i = detail::tid(); i < current_scratch.size(); i += detail::bdim()) {
+      current_scratch[i] = value_type { 0 };
+    }
+
+    detail::syncthreads();
+  }
+
+  DEVICE INLINE void store(const Vec3i& point, const toolbox::Vec3<value_type>& current)
+  {
+    // TODO: maybe box should store min and extent
+    const auto ext    = extent();
+    const auto volume = prod(ext);
+    const auto delta  = point - min;
+    const auto idx    = delta.z + delta.y * ext.z + delta.x * ext.y * ext.z;
+#pragma unroll
+    for(auto i = 0u; i < 3u; i++) {
+      sstd::atomic_add(&current_scratch[idx + i * volume], current[i]);
+    }
+  }
+
+  template<typename MDS>
+  DEVICE INLINE void copy_from_shared_to_global(MDS Jmds)
+  {
+    // TODO: maybe box should store min and extent
+    const auto ext    = extent();
+    const auto volume = prod(ext);
+    for(auto shmem_idx = detail::tid(); shmem_idx < volume;
+        shmem_idx += detail::bdim()) {
+      const auto si = (Vec3i { shmem_idx / (extent.y * extent.z),
+                               (shmem_idx / extent.z) % extent.y,
+                               shmem_idx % extent.z } +
+                       min)
+                        .template as<runko::index_t>();
+      const auto* const J[3] = {
+        &thrust::raw_reference_cast(Jmds[si.data][0]),
+        &thrust::raw_reference_cast(Jmds[si.data][1]),
+        &thrust::raw_reference_cast(Jmds[si.data][2]),
+      };
+
+#pragma unroll
+      for(auto i = 0u; i < 3u; i++) {
+        const auto val = current_scratch[shmem_idx + i * volume];
+        if(0 != val) { sstd::atomic_add(J[i], val); }
+      }
+    }
+
+    detail::syncthreads();
   }
 };
 
 template<typename value_type>
 DEVICE INLINE Box
   make_bounding_box(
-    std::uint32_t max_volume,
     const value_type cfl,
-    const std::array<value_type, 3> lattice_origo_coordinates,
     std::span<runko::prtc_id_type> ids_span,
     std::span<value_type> vel_span,
     std::span<value_type> pos_span,
-    std::span<std::uint32_t> scratch)
+    const std::array<value_type, 3> lattice_origo_coordinates,
+    std::span<std::byte> scratch)
 {
   using Vec3v = toolbox::Vec3<value_type>;
-  Box box;
+  Box box(scratch);
 
   for(auto elem_idx = detail::tid(); elem_idx < ids_span.size();
       elem_idx += detail::bdim()) {
@@ -386,8 +445,12 @@ DEVICE INLINE Box
     box.bound_points(i1, i2);
   }
 
-  box.bound_thread_boxes(scratch);
+  // Note: we're using the same scratch memory for this, as we'll be using for current
+  // later.
+  std::span<std::uint32_t> uint_scratch = make_aligned_span<std::uint32_t>(scratch);
+  box.bound_thread_boxes(uint_scratch);
   box.shrink_to_max_volume(max_volume);
+  box.clear_current();
 
   return box;
 }
@@ -407,36 +470,19 @@ DEVICE void
 {
   using Vec3v = toolbox::Vec3<value_type>;
 
-  std::span<std::uint32_t> uint_scratch = make_aligned_span<std::uint32_t>(scratch);
-
   // Make subspans for the box size computation.
   const auto count = sstd::min(ids_span.size(), num_box_candidates);
   const auto box   = make_bounding_box(
     cfl,
-    lattice_origo_coordinates,
     ids_span.subspan(0u, count),
-    pos_span.subspan(0u, count),
     vel_span.subspan(0u, count),
-    uint_scratch);
+    pos_span.subspan(0u, count),
+    lattice_origo_coordinates,
+    scratch);
 
-  std::span<value_type> value_scratch = make_aligned_span<value_type>(scratch);
-
-  for(auto i = detail::tid(); i < value_scratch.size(); i += detail::bdim()) {
-    value_scratch[i] = value_type { 0 };
-  }
-
-  detail::syncthreads();
-
-  const auto extent        = box.extent();
-  const auto volume        = prod(extent);
   const auto store_current = [&](const Vec3i& point, const Vec3v& current) {
     if(box.contains(point)) {
-      const auto delta = point - box.min;
-      const auto idx   = delta.z + delta.y * extent.z + delta.x * extent.y * extent.z;
-#pragma unroll
-      for(auto i = 0u; i < 3u; i++) {
-        sstd::atomic_add(&value_scratch[idx + i * volume], current[i]);
-      }
+      box.store(point, current);
     } else {
       const auto si  = point.template as<runko::index_t>();
       auto* const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
@@ -534,26 +580,7 @@ DEVICE void
 
   detail::syncthreads();
 
-  for(auto shmem_idx = detail::tid(); shmem_idx < volume; shmem_idx += detail::bdim()) {
-    const auto si = (Vec3i { shmem_idx / (extent.y * extent.z),
-                             (shmem_idx / extent.z) % extent.y,
-                             shmem_idx % extent.z } +
-                     box.min)
-                      .template as<runko::index_t>();
-    const auto* const J[3] = {
-      &thrust::raw_reference_cast(Jmds[si.data][0]),
-      &thrust::raw_reference_cast(Jmds[si.data][1]),
-      &thrust::raw_reference_cast(Jmds[si.data][2]),
-    };
-
-#pragma unroll
-    for(auto i = 0u; i < 3u; i++) {
-      const auto val = value_scratch[shmem_idx + i * volume];
-      if(0 != val) { sstd::atomic_add(J[i], val); }
-    }
-  }
-
-  detail::syncthreads();
+  box.copy_from_shared_to_global(Jmds);
 }
 
 template<typename value_type, typename MDS>
