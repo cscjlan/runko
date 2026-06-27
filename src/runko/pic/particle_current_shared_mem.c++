@@ -38,14 +38,12 @@
   #define INLINE inline
 #endif
 
+//    TODO: siirrä tämä koodi headeriin
+
 // Claude, here's some guides for you.
 // Assumptions:
 // - value_type = float
 // - runko::dead_prtc_id == maximum value of std::uint64_t
-//
-// TODO
-// - pos values are always positive and they start from
-// - a = 3 and
 //
 // write the following tests:
 // - for GPU (assume MI250X):
@@ -57,6 +55,7 @@
 //    correctly for that type. Test multiple types.
 // 6. Test that warp_reduce correctly reduces for different functions
 //    test multiple binary functions: min, max, add, sub, mul, div and so on
+//    TODO: kirjota nämä ohjeet uusiksi
 // 7. Box:
 //    Assume all points coordinates are non-negative
 //    7.1: Create a box with some min and max and check that `contains`
@@ -238,12 +237,19 @@ T
 // This assumes cells can never be negative
 template<typename value_type>
 struct Box {
-  Vec3i min                             = { ~0u };
-  Vec3i max                             = { 0u };
-  std::span<value_type> current_scratch = {};
+  Vec3i min                               = { ~0u };
+  Vec3i extent                            = { 0u };
+  std::span<value_type> current_scratch   = {};
+  std::span<std::uint32_t> bounds_scratch = {};
+  std::uint32_t volume                    = 0u;
 
-  DEVICE INLINE Box(std::span<std::byte> scratch) :
-    current_scratch(make_aligned_span<value_type>(scratch))
+  DEVICE INLINE
+    Box(const Vec3i& aabb_min, const Vec3i& aabb_max, std::span<std::byte> scratch) :
+    min(min),
+    extent(aabb_max - min),
+    current_scratch(make_aligned_span<value_type>(scratch)),
+    bounds_scratch(make_aligned_span<std::uint32_t>(scratch)),
+    volume(prod(extent))
   {
   }
 
@@ -252,34 +258,24 @@ struct Box {
     bool contained = true;
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
-      contained &= min[i] <= point[i] && point[i] < max[i];
+      contained &= min[i] <= point[i] && point[i] < min[i] + extent[i];
     }
 
     return contained;
   }
 
-  DEVICE INLINE Vec3i extent() const { return max - min; }
-
-  DEVICE INLINE void bound_points(const Vec3i& i1, const Vec3i& i2)
-  {
-#pragma unroll
-    for(auto i = 0u; i < 3; i++) {
-      min[i] = sstd::min(min[i], sstd::min(i1[i], i2[i]));
-      max[i] = sstd::max(max[i], sstd::max(i1[i], i2[i]));
-    }
-  }
-
-  DEVICE INLINE void bound_thread_boxes(std::span<std::uint32_t> scratch)
+  DEVICE INLINE void bound_thread_boxes()
   {
     // Each thread has their own bounding box. This function
     // bounds all the individual bounding boxes to a block-wide bounding box,
     // which each of the threads will then share.
 
     // Gather the bounds from the lanes of the warp to lane 0
+    Vec3i aabb_max = min + extent;
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
-      min[i] = warp_reduce(min[i], sstd::min<std::uint32_t>);
-      max[i] = warp_reduce(max[i], sstd::max<std::uint32_t>);
+      min[i]      = warp_reduce(min[i], sstd::min<std::uint32_t>);
+      aabb_max[i] = warp_reduce(aabb_max[i], sstd::max<std::uint32_t>);
     }
 
     // Lane 0 stores the bounds to scratch memory:
@@ -290,8 +286,8 @@ struct Box {
     if(0 == detail::lid()) {
 #pragma unroll
       for(auto i = 0u; i < 3u; i++) {
-        scratch[detail::wid() + i * detail::num_warps()]        = min[i];
-        scratch[detail::wid() + (3u + i) * detail::num_warps()] = max[i];
+        bounds_scratch[detail::wid() + i * detail::num_warps()]        = min[i];
+        bounds_scratch[detail::wid() + (3u + i) * detail::num_warps()] = aabb_max[i];
       }
     }
 
@@ -306,7 +302,7 @@ struct Box {
 
       // Only lanes with lane id < num_warps read the num_warps values from scratch
       if(detail::lid() < detail::num_warps()) {
-        val = scratch[detail::lid() + i * detail::num_warps()];
+        val = bounds_scratch[detail::lid() + i * detail::num_warps()];
       }
       const auto* f = i < 3u ? sstd::min<std::uint32_t> : sstd::max<std::uint32_t>;
 
@@ -319,7 +315,7 @@ struct Box {
       // Lane 0 stores the reduced bound back to scratch.
       // Store in the same location this warp read from to avoid data races with
       // other warps.
-      if(0 == detail::lid()) { scratch[i * detail::num_warps()] = val; }
+      if(0 == detail::lid()) { bounds_scratch[i * detail::num_warps()] = val; }
     }
 
     detail::syncthreads();
@@ -329,9 +325,11 @@ struct Box {
     // all the points considered by the block.
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
-      min[i] = scratch[i * detail::num_warps()];
-      max[i] = scratch[(i + 3u) * detail::num_warps()];
+      min[i]      = bounds_scratch[i * detail::num_warps()];
+      aabb_max[i] = bounds_scratch[(i + 3u) * detail::num_warps()];
     }
+
+    extent = aabb_max - min;
   }
 
   DEVICE INLINE void shrink_to_max_volume(std::uint32_t max_volume)
@@ -348,19 +346,17 @@ struct Box {
     // we'll be adding current to the neighbouring cells in the positive directions,
     // so we'll increase the size in each dimension by one.
     max += Vec3i { 2u };
-    auto ext    = extent();
-    auto volume = prod(ext);
+    volume = prod(extent);
 
     // We'll be storing three boxes in the same volume, because we'll be storing
     // a current of Vec3 in the same scratch memory.
     while(max_volume < 3u * volume) {
-      const auto i = ext[0u] > ext[1u] ? (ext[0u] > ext[2u] ? 0u : 2u)
-                                       : (ext[1u] > ext[2u] ? 1u : 2u);
-      ext[i] -= 1u;
-      volume = prod(ext);
+      const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
+                                             : (extent[1u] > extent[2u] ? 1u : 2u);
+      extent[i] -= 1u;
+      volume = prod(extent);
     }
 
-    max = min + ext;
     // Resize the span
     current_scratch = current_scratch.subspan(0u, 3u * volume);
   }
@@ -376,11 +372,8 @@ struct Box {
 
   DEVICE INLINE void store(const Vec3i& point, const toolbox::Vec3<value_type>& current)
   {
-    // TODO: maybe box should store min and extent
-    const auto ext    = extent();
-    const auto volume = prod(ext);
-    const auto delta  = point - min;
-    const auto idx    = delta.z + delta.y * ext.z + delta.x * ext.y * ext.z;
+    const auto delta = point - min;
+    const auto idx   = delta.z + delta.y * extent.z + delta.x * extent.y * extent.z;
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
       sstd::atomic_add(&current_scratch[idx + i * volume], current[i]);
@@ -390,9 +383,6 @@ struct Box {
   template<typename MDS>
   DEVICE INLINE void copy_from_shared_to_global(MDS Jmds)
   {
-    // TODO: maybe box should store min and extent
-    const auto ext    = extent();
-    const auto volume = prod(ext);
     for(auto shmem_idx = detail::tid(); shmem_idx < volume;
         shmem_idx += detail::bdim()) {
       const auto si = (Vec3i { shmem_idx / (extent.y * extent.z),
@@ -421,6 +411,7 @@ template<typename value_type>
 DEVICE INLINE Box
   make_bounding_box(
     const value_type cfl,
+    std::uint32_t max_volume,
     std::span<runko::prtc_id_type> ids_span,
     std::span<value_type> vel_span,
     std::span<value_type> pos_span,
@@ -428,8 +419,9 @@ DEVICE INLINE Box
     std::span<std::byte> scratch)
 {
   using Vec3v = toolbox::Vec3<value_type>;
-  Box box(scratch);
 
+  Vec3i aabb_min = { ~0u };
+  Vec3i aabb_max = { 0u };
   for(auto elem_idx = detail::tid(); elem_idx < ids_span.size();
       elem_idx += detail::bdim()) {
     if(ids_span[elem_idx] == runko::dead_prtc_id) { continue; }
@@ -442,13 +434,15 @@ DEVICE INLINE Box
     const auto i1 = x1.template as<std::uint32_t>();
     const auto i2 = x2.template as<std::uint32_t>();
 
-    box.bound_points(i1, i2);
+#pragma unroll
+    for(auto i = 0u; i < 3; i++) {
+      aabb_min[i] = sstd::min(aabb_min[i], sstd::min(i1[i], i2[i]));
+      aabb_max[i] = sstd::max(aabb_max[i], sstd::max(i1[i], i2[i]));
+    }
   }
 
-  // Note: we're using the same scratch memory for this, as we'll be using for current
-  // later.
-  std::span<std::uint32_t> uint_scratch = make_aligned_span<std::uint32_t>(scratch);
-  box.bound_thread_boxes(uint_scratch);
+  Box box(aabb_min, aabb_max, scratch);
+  box.bound_thread_boxes();
   box.shrink_to_max_volume(max_volume);
   box.clear_current();
 
@@ -461,6 +455,7 @@ DEVICE void
     std::uint32_t num_box_candidates,
     const value_type cfl,
     const value_type charge,
+    std::uint32_t max_volume,
     std::span<runko::prtc_id_type> ids_span,
     std::span<value_type> vel_span,
     std::span<value_type> pos_span,
@@ -474,6 +469,7 @@ DEVICE void
   const auto count = sstd::min(ids_span.size(), num_box_candidates);
   const auto box   = make_bounding_box(
     cfl,
+    max_volume,
     ids_span.subspan(0u, count),
     vel_span.subspan(0u, count),
     pos_span.subspan(0u, count),
@@ -606,6 +602,8 @@ GLOBAL void
   assert(num_shared_bytes > 3u * 2u * 2u * 2u * sizeof(value_type));
   assert(num_shared_bytes > 6u * detail::num_warps() * sizeof(std::uint32_t));
 
+  const auto max_volume = num_shared_bytes;
+
   std::span<std::byte> scratch_span(scratch, num_shared_bytes);
 
   // Work over chunks: each block goes over a chunk and chunk size may
@@ -619,6 +617,7 @@ GLOBAL void
       num_box_candidates,
       cfl,
       charge,
+      max_volume,
       ids_span.subspan(chunk_offset, chunk_size),
       vel_span.subspan(chunk_offset, chunk_size),
       pos_span.subspan(chunk_offset, chunk_size),
