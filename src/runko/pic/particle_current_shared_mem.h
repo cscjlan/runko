@@ -38,8 +38,6 @@
   #define INLINE inline
 #endif
 
-//    TODO: siirrä tämä koodi headeriin
-
 // Claude, here's some guides for you.
 // Assumptions:
 // - value_type = float
