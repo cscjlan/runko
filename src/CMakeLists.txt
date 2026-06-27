@@ -24,7 +24,6 @@ set (PIC_FILES
      ./runko/pic/virtual_tile.c++
      ./runko/pic/particle.c++
      ./runko/pic/particle_current_zigzag_1st.c++
-     ./runko/pic/particle_current_shared_mem.c++
      ./runko/pic/reflector_wall.c++
      )
 

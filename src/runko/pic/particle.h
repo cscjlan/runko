@@ -230,6 +230,15 @@ public:
     const std::array<value_type, 3> lattice_origo_coordinates,
     const double cfl) const;
 
+  /// Adds generated current to given grid.
+  ///
+  /// `lattice_origo_coordinates` is in coordinates of the particles,
+  /// and the spacing between cells in `Jout` is 1.
+  /// Assumes that all particle contributions are inside the lattice.
+  void current_zigzag_1st_shared(
+    runko::VecGrid<emf::YeeLattice::value_type>& Jout,
+    const std::array<value_type, 3> lattice_origo_coordinates,
+    const double cfl_) const;
 
   /// Reflect particles crossing a wall and deposit correction currents.
   ///

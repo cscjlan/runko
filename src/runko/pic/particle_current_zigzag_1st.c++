@@ -1,6 +1,7 @@
 // Copyright 2025 - 2026, Miro Palmu, Joonas Nättilä and the runko contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "particle_current_shared_mem.h"
 #include "runko/emf/yee_lattice.h"
 #include "runko/pic/particle.h"
 #include "thrust/device_vector.h"
@@ -337,4 +338,38 @@ void
     .wait();
 }
 
+void
+  ParticleContainer::current_zigzag_1st_shared(
+    runko::VecGrid<emf::YeeLattice::value_type>& Jout,
+    const std::array<value_type, 3> lattice_origo_coordinates,
+    const double cfl_) const
+{
+  const auto Jmds         = Jout.mds();
+  const auto pos_mds     = pos_.mds();
+  const auto vel_mds     = vel_.mds();
+  const auto ids_mds     = ids_.mds();
+  const value_type charge = static_cast<value_type>(charge_);
+  const value_type cfl    = static_cast<value_type>(cfl_);
+
+  const dim3 threads { 1024, 1, 1 };
+  const dim3 blocks { 1024, 1, 1 };
+  const std::uint32_t num_shared_bytes   = 32000ul;
+  const std::uint32_t chunk_size         = 4ul * blocks.x;
+  const std::uint32_t num_chunks         = static_cast<std::uint32_t>(pos_mds.size() / chunk_size) + 1ul;
+  const std::uint32_t num_box_candidates = blocks.x;
+
+  deposit_current_kernel<<<blocks, threads, num_shared_bytes, 0>>>(
+    num_chunks,
+    chunk_size,
+    num_shared_bytes,
+    num_box_candidates,
+    cfl,
+    charge,
+    ids_mds,
+    vel_mds,
+    pos_mds,
+    Jmds,
+    lattice_origo_coordinates);
+  [[maybe_unused]] const auto result = hipDeviceSynchronize();
+}
 }  // namespace pic

@@ -1,6 +1,8 @@
 // Copyright 2025 - 2026, Miro Palmu, Joonas Nättilä and the runko contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#pragma once
+
 #include "runko/emf/yee_lattice.h"
 #include "runko/pic/particle.h"
 #include "runko/tools/math.h"
@@ -24,6 +26,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 #if defined(TYVI_BACKEND_HIP)
   #include "hip/hip_runtime.h"
@@ -43,8 +46,8 @@
 // - value_type = float
 // - runko::dead_prtc_id == maximum value of std::uint64_t
 //
-// write the following tests:
-// - for GPU (assume MI250X):
+// Write the following tests for GPU (assume MI250X).
+// Use boost ut.h testing framework.
 // 1. Compare detail::shfl_down to the intrinsic __shfl_down
 // 2. Test detail::num_warps for different block sizes
 // 3. Test detail::wid for different block sizes, always less than num_warps
@@ -59,11 +62,9 @@
 //        works correctly for a bunch of points.
 //    7.2: Use LDS big enough to fit at least 96 std::uint32_t
 //         and test that `bound_thread_boxes` creates a box that bounds
-//         all the (different shapes and sizes of) the boxes that individual threads have
-//    7.3: With max_volume in range [24, 64000/2/8/3] check that `shrink_to_max_volume`
-//         shrinks boxes of different sizes (and shapes!) such that the volume of the
-//         box multiplied by three is then less than the max_volume.
-//    7.4: `clear_current` should clear the current scratch to zero
+//         all the (different shapes and sizes of) the boxes that individual threads
+//         have
+//    7.4: `clear_scratch` should clear the scratch to zero
 //    7.5: Compare `store` to a simpler way to create a histogram of currents:
 //         use e.g. global atomics, and compare those with the values stored
 //         in the shared memory. For this, you should of course create some points,
@@ -145,7 +146,7 @@ INLINE DEVICE void
 }
 
 template<typename T, typename I>
-INLINE DEVICE std::uint32_t
+INLINE DEVICE T
   shfl_down(T a, I)
 {
   return a;
@@ -204,18 +205,6 @@ INLINE DEVICE std::uint32_t
 namespace pic {
 using Vec3i = toolbox::Vec3<std::uint32_t>;
 
-template<typename T>
-INLINE DEVICE std::span<T>
-  make_aligned_span(std::span<std::byte> byte_span)
-{
-  static constexpr auto alignment = std::alignment_of_v<T>;
-  const auto byte_address         = reinterpret_cast<std::uintptr_t>(byte_span.data());
-  const auto bytes_over_alignment = byte_address & (alignment - 1ul);
-  const auto padding =
-    bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
-  return std::span<T>(byte_span.data() + padding, byte_span.size() - padding);
-}
-
 template<typename T, typename F>
 INLINE DEVICE T
   warp_reduce(T t, F f)
@@ -235,22 +224,81 @@ INLINE DEVICE T
   return v[0] * v[1] * v[2];
 }
 
+struct Scratch {
+  std::span<std::byte> scratch;
+
+  template<typename T>
+  INLINE DEVICE T* data()
+  {
+    static constexpr auto alignment = std::alignment_of_v<T>;
+    const auto address              = reinterpret_cast<std::uintptr_t>(scratch.data());
+    const auto bytes_over_alignment = address & (alignment - 1ul);
+    const auto padding =
+      bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
+    return static_cast<T*>(static_cast<void*>(scratch.data() + padding));
+  }
+
+  template<typename T>
+  INLINE DEVICE const T* data() const
+  {
+    static constexpr auto alignment = std::alignment_of_v<T>;
+    const auto address              = reinterpret_cast<std::uintptr_t>(scratch.data());
+    const auto bytes_over_alignment = address & (alignment - 1ul);
+    const auto padding =
+      bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
+    return static_cast<T*>(static_cast<void*>(scratch.data() + padding));
+  }
+
+  template<typename T>
+  INLINE DEVICE T& operator[](std::size_t i)
+  {
+    return data<T>()[i];
+  }
+
+  template<typename T>
+  INLINE DEVICE const T& operator[](std::size_t i) const
+  {
+    return data<T>()[i];
+  }
+
+  template<typename T>
+  INLINE DEVICE std::size_t size() const
+  {
+    static constexpr auto alignment = std::alignment_of_v<T>;
+    const auto address              = reinterpret_cast<std::uintptr_t>(scratch.data());
+    const auto bytes_over_alignment = address & (alignment - 1ul);
+    const auto padding =
+      bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
+    return (scratch.size() - padding) / sizeof(T);
+  }
+
+  template<typename T>
+  INLINE DEVICE void resize(std::size_t i)
+  {
+    std::byte* end = static_cast<std::byte*>(static_cast<void*>(data<T>() + i));
+    scratch        = std::span<std::byte>(
+      scratch.data(),
+      static_cast<std::size_t>(end - scratch.data()));
+  }
+
+  INLINE DEVICE void set_to_zero()
+  {
+    for(auto i = detail::tid(); i < scratch.size(); i += detail::bdim()) {
+      scratch.data()[i] = std::byte { 0 };
+    }
+    detail::syncthreads();
+  }
+};
+
 // This assumes cells can never be negative
 template<typename value_type>
 struct Box {
-  Vec3i min                               = { ~0u, ~0u, ~0u };
-  Vec3i extent                            = { 0u, 0u, 0u };
-  std::span<value_type> current_scratch   = {};
-  std::span<std::uint32_t> bounds_scratch = {};
-  std::uint32_t volume                    = 0u;
+  Vec3i min    = { ~0u, ~0u, ~0u };
+  Vec3i extent = { 0u, 0u, 0u };
 
-  DEVICE INLINE
-    Box(const Vec3i& aabb_min, const Vec3i& aabb_max, std::span<std::byte> scratch) :
+  DEVICE INLINE Box(const Vec3i& aabb_min, const Vec3i& aabb_max) :
     min(aabb_min),
-    extent(aabb_max - min),
-    current_scratch(make_aligned_span<value_type>(scratch)),
-    bounds_scratch(make_aligned_span<std::uint32_t>(scratch)),
-    volume(prod(extent))
+    extent(aabb_max - min)
   {
   }
 
@@ -265,7 +313,7 @@ struct Box {
     return contained;
   }
 
-  DEVICE INLINE void bound_thread_boxes()
+  DEVICE INLINE void bound_thread_boxes(Scratch scratch)
   {
     // Each thread has their own bounding box. This function
     // bounds all the individual bounding boxes to a block-wide bounding box,
@@ -287,36 +335,42 @@ struct Box {
     if(0 == detail::lid()) {
 #pragma unroll
       for(auto i = 0u; i < 3u; i++) {
-        bounds_scratch[detail::wid() + i * detail::num_warps()]        = min[i];
-        bounds_scratch[detail::wid() + (3u + i) * detail::num_warps()] = aabb_max[i];
+        scratch.operator[]<std::uint32_t>(detail::wid() + i * detail::num_warps()) =
+          min[i];
+        scratch.operator[]<std::uint32_t>(
+          detail::wid() + (3u + i) * detail::num_warps()) = aabb_max[i];
       }
     }
 
     detail::syncthreads();
 
-    // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps need
-    // to reduce more than one bound. If there are more than six warps, the first
-    // six warps do the reductions is parallel.
+    // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps
+    // need to reduce more than one bound. If there are more than six warps,
+    // the first six warps do the reductions is parallel.
     for(auto i = detail::wid(); i < 6u; i += detail::num_warps()) {
       // Each thread participates to avoid deadlock with syncthreads
       std::uint32_t val = 0u;
 
-      // Only lanes with lane id < num_warps read the num_warps values from scratch
+      // Only lanes with lane id < num_warps read the num_warps values from
+      // scratch
       if(detail::lid() < detail::num_warps()) {
-        val = bounds_scratch[detail::lid() + i * detail::num_warps()];
+        val =
+          scratch.operator[]<std::uint32_t>(detail::lid() + i * detail::num_warps());
       }
       const auto f = i < 3u ? sstd::min<std::uint32_t> : sstd::max<std::uint32_t>;
 
-      // All lanes participate, but lane 0 only contains reductions from first num_warps
-      // lanes.
+      // All lanes participate, but lane 0 only contains reductions from first
+      // num_warps lanes.
       for(auto j = detail::num_warps() / 2u; j >= 1u; j /= 2u) {
         val = f(val, detail::shfl_down(val, j));
       }
 
       // Lane 0 stores the reduced bound back to scratch.
-      // Store in the same location this warp read from to avoid data races with
-      // other warps.
-      if(0 == detail::lid()) { bounds_scratch[i * detail::num_warps()] = val; }
+      // Store in the same location this warp read from to avoid data races
+      // with other warps.
+      if(0 == detail::lid()) {
+        scratch.operator[]<std::uint32_t>(i * detail::num_warps()) = val;
+      }
     }
 
     detail::syncthreads();
@@ -326,72 +380,69 @@ struct Box {
     // all the points considered by the block.
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
-      min[i]      = bounds_scratch[i * detail::num_warps()];
-      aabb_max[i] = bounds_scratch[(i + 3u) * detail::num_warps()];
+      min[i]      = scratch.operator[]<std::uint32_t>(i * detail::num_warps());
+      aabb_max[i] = scratch.operator[]<std::uint32_t>((i + 3u) * detail::num_warps());
     }
 
     extent = aabb_max - min;
   }
 
-  DEVICE INLINE void shrink_to_max_volume(std::uint32_t max_volume)
+  DEVICE INLINE std::size_t fit_to_scratch(Scratch scratch)
   {
     // The box is large enough to bound all the particles.
     // It may be too large to fit into scratch memory, so it may have to
     // be shrunk. We do that here.
 
     // Increase size by two:
-    // If all the particles are in the same cell, the min and max bounds are the same.
-    // To make the upper bound strictly larger than any of the particle positions,
-    // increase it by one.
-    // The other one comes from the stencil operation to the J grid:
-    // we'll be adding current to the neighbouring cells in the positive directions,
-    // so we'll increase the size in each dimension by one.
-    extent = extent + Vec3i { 2u, 2u, 2u };
-    volume = prod(extent);
+    // If all the particles are in the same cell, the min and max bounds are
+    // the same. To make the upper bound strictly larger than any of the
+    // particle positions, increase it by one. The other one comes from the
+    // stencil operation to the J grid: we'll be adding current to the
+    // neighbouring cells in the positive directions, so we'll increase the
+    // size in each dimension by one.
+    extent          = extent + Vec3i { 2u, 2u, 2u };
+    auto volume     = prod(extent);
+    const auto size = scratch.size<std::uint32_t>();
 
-    // We'll be storing three boxes in the same volume, because we'll be storing
-    // a current of Vec3 in the same scratch memory.
-    while(max_volume < 3u * volume) {
+    // We'll be storing three boxes in the same volume, because we'll be
+    // storing a current of Vec3 in the same scratch memory.
+    while(size < 3u * volume) {
       const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
                                              : (extent[1u] > extent[2u] ? 1u : 2u);
       extent[i] -= 1u;
       volume = prod(extent);
     }
 
-    // Resize the span
-    current_scratch = current_scratch.subspan(0u, 3u * volume);
+    const auto count = 3u * volume;
+    return count;
   }
 
-  DEVICE INLINE void clear_current()
+  DEVICE INLINE void
+    store(const Vec3i& point, const toolbox::Vec3<value_type>& current, Scratch scratch)
   {
-    for(auto i = detail::tid(); i < current_scratch.size(); i += detail::bdim()) {
-      current_scratch[i] = value_type { 0 };
-    }
-
-    detail::syncthreads();
-  }
-
-  DEVICE INLINE void store(const Vec3i& point, const toolbox::Vec3<value_type>& current)
-  {
-    const auto delta = point - min;
-    const auto idx   = delta[2] + delta[1] * extent[2] + delta[0] * extent[1] * extent[2];
+    const auto num_cells_per_component = scratch.size<value_type>() / 3u;
+    const auto delta                   = point - min;
+    const auto idx = delta[2] + delta[1] * extent[2] + delta[0] * extent[1] * extent[2];
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
-      sstd::atomic_add(&current_scratch[idx + i * volume], current[i]);
+      sstd::atomic_add(
+        &scratch.operator[]<value_type>(idx + i * num_cells_per_component),
+        current[i]);
     }
   }
 
-  template<typename MDS>
-  DEVICE INLINE void copy_from_shared_to_global(MDS Jmds)
+  template<typename JMDS>
+  DEVICE INLINE void copy_from_shared_to_global(JMDS Jmds, Scratch scratch)
   {
-    for(auto shmem_idx = detail::tid(); shmem_idx < volume;
+    const auto num_cells_per_component = scratch.size<value_type>() / 3u;
+    for(auto shmem_idx = detail::tid(); shmem_idx < num_cells_per_component;
         shmem_idx += detail::bdim()) {
       const auto si = (Vec3i { shmem_idx / (extent[1] * extent[2]),
                                (shmem_idx / extent[2]) % extent[1],
                                shmem_idx % extent[2] } +
                        min)
                         .as<runko::index_t>();
-      const auto* const J[3] = {
+      value_type* const J[3] = {
         &thrust::raw_reference_cast(Jmds[si.data][0]),
         &thrust::raw_reference_cast(Jmds[si.data][1]),
         &thrust::raw_reference_cast(Jmds[si.data][2]),
@@ -399,7 +450,8 @@ struct Box {
 
 #pragma unroll
       for(auto i = 0u; i < 3u; i++) {
-        const auto val = current_scratch[shmem_idx + i * volume];
+        const auto val =
+          scratch.operator[]<value_type>(shmem_idx + i * num_cells_per_component);
         if(0 != val) { sstd::atomic_add(J[i], val); }
       }
     }
@@ -408,29 +460,29 @@ struct Box {
   }
 };
 
-template<typename value_type>
-DEVICE INLINE Box<value_type>
-  make_bounding_box(
+template<typename value_type, typename VMDS, typename IMDS>
+DEVICE INLINE std::pair<Vec3i, Vec3i>
+  compute_thread_bounds(
     const value_type cfl,
-    std::uint32_t max_volume,
-    std::span<runko::prtc_id_type> ids_span,
-    std::span<value_type> vel_span,
-    std::span<value_type> pos_span,
-    const std::array<value_type, 3> lattice_origo_coordinates,
-    std::span<std::byte> scratch)
+    std::uint32_t offset,
+    std::uint32_t count,
+    IMDS ids_mds,
+    VMDS vel_mds,
+    VMDS pos_mds,
+    const std::array<value_type, 3> lattice_origo_coordinates)
 {
   using Vec3v = toolbox::Vec3<value_type>;
 
   Vec3i aabb_min = { ~0u, ~0u, ~0u };
   Vec3i aabb_max = { 0u, 0u, 0u };
-  for(auto elem_idx = detail::tid(); elem_idx < ids_span.size();
+  for(auto elem_idx = offset + detail::tid(); elem_idx < offset + count;
       elem_idx += detail::bdim()) {
-    if(ids_span[elem_idx] == runko::dead_prtc_id) { continue; }
+    if(ids_mds[elem_idx][] == runko::dead_prtc_id) { continue; }
 
-    const auto u = Vec3v(vel_span[elem_idx]);
+    const auto u = Vec3v(vel_mds[elem_idx]);
     const auto invgam =
       value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
-    const auto x2 = Vec3v(pos_span[elem_idx]) - Vec3v(lattice_origo_coordinates);
+    const auto x2 = Vec3v(pos_mds[elem_idx]) - Vec3v(lattice_origo_coordinates);
     const auto x1 = x2 - cfl * invgam * u;
     const auto i1 = x1.template as<std::uint32_t>();
     const auto i2 = x2.template as<std::uint32_t>();
@@ -442,44 +494,46 @@ DEVICE INLINE Box<value_type>
     }
   }
 
-  Box<value_type> box(aabb_min, aabb_max, scratch);
-  box.bound_thread_boxes();
-  box.shrink_to_max_volume(max_volume);
-  box.clear_current();
-
-  return box;
+  return std::make_pair(aabb_min, aabb_max);
 }
 
-template<typename value_type, typename MDS>
+template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
 DEVICE void
   deposit_current(
     std::uint32_t num_box_candidates,
+    std::uint32_t chunk_offset,
+    std::uint32_t chunk_size,
     const value_type cfl,
     const value_type charge,
-    std::uint32_t max_volume,
-    std::span<runko::prtc_id_type> ids_span,
-    std::span<value_type> vel_span,
-    std::span<value_type> pos_span,
-    MDS Jmds,
+    IMDS ids_mds,
+    VMDS vel_mds,
+    VMDS pos_mds,
+    JMDS Jmds,
     const std::array<value_type, 3> lattice_origo_coordinates,
-    std::span<std::byte> scratch)
+    std::span<std::byte> scratch_memory)
 {
   using Vec3v = toolbox::Vec3<value_type>;
 
-  // Make subspans for the box size computation.
-  const auto count = sstd::min(ids_span.size(), static_cast<std::size_t>(num_box_candidates));
-  const auto box   = make_bounding_box(
+  const auto count                = sstd::min(ids_mds.size(), num_box_candidates);
+  const auto [aabb_min, aabb_max] = compute_thread_bounds(
     cfl,
-    max_volume,
-    ids_span.subspan(0u, count),
-    vel_span.subspan(0u, count),
-    pos_span.subspan(0u, count),
-    lattice_origo_coordinates,
-    scratch);
+    chunk_offset,
+    count,
+    ids_mds,
+    vel_mds,
+    pos_mds,
+    lattice_origo_coordinates);
+
+  Scratch scratch = { scratch_memory };
+  Box<value_type> box(aabb_min, aabb_max);
+  box.bound_thread_boxes(scratch);
+  const auto new_size = box.fit_to_scratch(scratch);
+  scratch.resize<value_type>(new_size);
+  scratch.set_to_zero();
 
   const auto store_current = [&](const Vec3i& point, const Vec3v& current) {
     if(box.contains(point)) {
-      box.store(point, current);
+      box.store(point, current, scratch);
     } else {
       const auto si  = point.template as<runko::index_t>();
       auto* const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
@@ -492,15 +546,16 @@ DEVICE void
     }
   };
 
-  for(auto elem_idx = detail::tid(); elem_idx < ids_span.size();
+  for(auto elem_idx = chunk_offset + detail::tid();
+      elem_idx < chunk_offset + chunk_size;
       elem_idx += detail::bdim()) {
-    if(ids_span[elem_idx] == runko::dead_prtc_id) { continue; }
+    if(ids_mds[elem_idx][] == runko::dead_prtc_id) { continue; }
 
-    const auto u = Vec3v(vel_span[elem_idx]).template as<value_type>();
+    const auto u = Vec3v(vel_mds[elem_idx]).template as<value_type>();
     const auto invgam =
       value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
 
-    const auto x2 = Vec3v(pos_span[elem_idx]).template as<value_type>() -
+    const auto x2 = Vec3v(pos_mds[elem_idx]).template as<value_type>() -
                     Vec3v(lattice_origo_coordinates).template as<value_type>();
 
     const auto x1 = x2 - cfl * invgam * u;
@@ -577,10 +632,10 @@ DEVICE void
 
   detail::syncthreads();
 
-  box.copy_from_shared_to_global(Jmds);
+  box.copy_from_shared_to_global(Jmds, scratch);
 }
 
-template<typename value_type, typename MDS>
+template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
 GLOBAL void
   deposit_current_kernel(
     std::uint32_t num_chunks,
@@ -589,23 +644,21 @@ GLOBAL void
     std::uint32_t num_box_candidates,
     const value_type cfl,
     const value_type charge,
-    std::span<runko::prtc_id_type> ids_span,
-    std::span<value_type> vel_span,
-    std::span<value_type> pos_span,
-    MDS Jmds,
+    IMDS ids_mds,
+    VMDS vel_mds,
+    VMDS pos_mds,
+    JMDS Jmds,
     const std::array<value_type, 3> lattice_origo_coordinates)
 {
   extern SHARED std::byte scratch[];
 
   // At least a 2x2x2 box of Vec3 must fit into scratch
-  // box creation also uses scratch and requires 6 * num_warps * sizeof(std::uint32_t)
-  // bytes
+  // box creation also uses scratch and requires 6 * num_warps *
+  // sizeof(std::uint32_t) bytes
   assert(num_shared_bytes > 3u * 2u * 2u * 2u * sizeof(value_type));
   assert(num_shared_bytes > 6u * detail::num_warps() * sizeof(std::uint32_t));
 
-  const auto max_volume = num_shared_bytes;
-
-  std::span<std::byte> scratch_span(scratch, num_shared_bytes);
+  std::span<std::byte> scratch_memory(scratch, num_shared_bytes);
 
   // Work over chunks: each block goes over a chunk and chunk size may
   // be different from block dimension. There's no point for it being smaller
@@ -616,15 +669,16 @@ GLOBAL void
     const auto chunk_offset = chunk_idx * chunk_size;
     deposit_current(
       num_box_candidates,
+      chunk_offset,
+      chunk_size,
       cfl,
       charge,
-      max_volume,
-      ids_span.subspan(chunk_offset, chunk_size),
-      vel_span.subspan(chunk_offset, chunk_size),
-      pos_span.subspan(chunk_offset, chunk_size),
+      ids_mds,
+      vel_mds,
+      pos_mds,
       Jmds,
       lattice_origo_coordinates,
-      scratch_span);
+      scratch_memory);
   }
 }
 }  // namespace pic
