@@ -107,6 +107,8 @@ pic::CurrentDepositer
     return pic::CurrentDepositer::zigzag_1st;
   } else if(p == "zigzag_1st_atomic") {
     return pic::CurrentDepositer::zigzag_1st_atomic;
+  } else if(p == "zigzag_1st_shared") {
+    return pic::CurrentDepositer::zigzag_1st_shared;
   } else {
     const auto msg = std::format("{} is not supported current depositer.", p);
     throw std::runtime_error { msg };
@@ -400,6 +402,27 @@ void
 
       for(const auto& [_, pcontainer]: this->particle_buffs_) {
         pcontainer.current_zigzag_1st(generated_J, origo_pos, this->cfl_);
+      }
+
+      this->yee_lattice_.deposit_current(generated_J);
+      break;
+    }
+    case CurrentDepositer::zigzag_1st_shared: {
+      if(not this->generated_J_cache_) {
+        this->generated_J_cache_ = runko::VecGrid<emf::YeeLattice::value_type>(
+          this->yee_lattice_.extents_with_halo());
+      }
+      auto& generated_J = this->generated_J_cache_.value();
+
+      const auto genJmds = generated_J.mds();
+      tyvi::mdgrid_work {}
+        .for_each_index(
+          genJmds,
+          [=](const auto idx, const auto tidx) { genJmds[idx][tidx] = 0; })
+        .wait();
+
+      for(const auto& [_, pcontainer]: this->particle_buffs_) {
+        pcontainer.current_zigzag_1st_shared(generated_J, origo_pos, this->cfl_);
       }
 
       this->yee_lattice_.deposit_current(generated_J);
