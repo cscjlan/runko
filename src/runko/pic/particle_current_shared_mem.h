@@ -89,17 +89,24 @@ __host__ __device__ constexpr std::size_t
 }
 
 template<typename T, typename U>
+__device__ std::size_t
+  max_capacity_of_memory_for_type(std::span<U> memory)
+{
+  auto *ptr          = align_up<T>(memory.data());
+  const auto padding = reinterpret_cast<std::uintptr_t>(ptr) -
+                       reinterpret_cast<std::uintptr_t>(memory.data());
+  const auto total_bytes = memory.size() * sizeof(U);
+  if(padding >= total_bytes) { return 0; }
+  return (total_bytes - padding) / sizeof(T);
+}
+
+template<typename T, typename U>
 __device__ std::span<T>
   reinterpret_span_or_empty(std::span<U> from)
 {
-  // If `from` is too small to fit either the padding, we'll return
-  // an empty span
-  auto *ptr          = deposit_kernel::align_up<T>(from.data());
-  const auto padding = reinterpret_cast<std::uintptr_t>(ptr) -
-                       reinterpret_cast<std::uintptr_t>(from.data());
-  const auto total_bytes = from.size() * sizeof(U);
-  if(padding >= total_bytes) { return std::span<T>(ptr, 0); }
-  return std::span<T>(ptr, (total_bytes - padding) / sizeof(T));
+  return std::span<T>(
+    align_up<T>(from.data()),
+    max_capacity_of_memory_for_type<T>(from));
 }
 }  // namespace deposit_kernel
 
@@ -132,45 +139,6 @@ __global__ void
                            blockDim.x,
                            deposit_kernel::num_warps(blockDim.x, warpSize))));
 
-  // Each thread in the block shares these pointers.
-  // They're used to store the x1 and x2 vectors that will be read from global memory
-  // (pos & vel)
-  const auto shared_xs_stride = blockDim.x;
-  [[maybe_unused]] const std::array<value_type *, deposit_kernel::vt_shared_mem_regions>
-    shared_xs = [&]() {
-      auto *first = deposit_kernel::align_up<value_type>(scratch);
-      std::array<value_type *, deposit_kernel::vt_shared_mem_regions> ptrs = {};
-      for(auto &ptr: ptrs) {
-        ptr = first;
-        first += shared_xs_stride;
-      }
-
-      return ptrs;
-    }();
-
-  // This can coexist with shared_xs, these are stored after them.
-  [[maybe_unused]] const std::array<bound_type *, deposit_kernel::bt_shared_mem_regions>
-    shared_bounds = [&]() {
-      // We're using the same shared memory arena for value_types and bound_types.
-      // Here we align the memory after the last of value_type to be suitable for
-      // bound_type.
-      auto *first =
-        deposit_kernel::align_up<bound_type>(shared_xs.back() + shared_xs_stride);
-      std::array<bound_type *, deposit_kernel::bt_shared_mem_regions> ptrs = {};
-      for(auto &ptr: ptrs) {
-        ptr = first;
-        first += deposit_kernel::num_warps(blockDim.x, warpSize);
-      }
-
-      return ptrs;
-    }();
-
-  // We're aliasing the same shared memory as the two arrays above.
-  // This cannot coexist with them.
-  [[maybe_unused]] auto box =
-    deposit_kernel::reinterpret_span_or_empty<value_type, std::byte>(
-      std::span<std::byte>(scratch, num_shared_bytes));
-
   const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
   const auto stride = blockDim.x * gridDim.x;
   // The warp reductions inside won't work if length of data is not
@@ -184,109 +152,185 @@ __global__ void
   for(auto idx = tid; idx < end; idx += stride) {
     // N.B. Must not use continue to skip dead particles before
     // we're done with warp reductions. Otherwise they can produce garbage
+    const bool im_alive = idx < ids_mds.size() && runko::dead_prtc_id != ids_mds[idx][];
 
-    auto guarded_access = [&](auto mds, auto otherwise) {
-      return idx < mds.size() ? mds[idx][] : otherwise;
+    auto positions_and_bounds = [&]() {
+      // Each thread in the block shares these pointers.
+      // They're used to store the x1 and x2 vectors that will be read from global
+      // memory (pos & vel)
+      const auto shared_xs_stride = blockDim.x;
+      const std::array<value_type *, deposit_kernel::vt_shared_mem_regions> shared_xs =
+        [&]() {
+          auto *first = deposit_kernel::align_up<value_type>(scratch);
+          std::array<value_type *, deposit_kernel::vt_shared_mem_regions> ptrs = {};
+          for(auto &ptr: ptrs) {
+            ptr = first;
+            first += shared_xs_stride;
+          }
+
+          return ptrs;
+        }();
+
+      // This can coexist with shared_xs, these are stored after them.
+      const std::array<bound_type *, deposit_kernel::bt_shared_mem_regions>
+        shared_bounds = [&]() {
+          // We're using the same shared memory arena for value_types and bound_types.
+          // Here we align the memory after the last of value_type to be suitable for
+          // bound_type.
+          auto *first =
+            deposit_kernel::align_up<bound_type>(shared_xs.back() + shared_xs_stride);
+          std::array<bound_type *, deposit_kernel::bt_shared_mem_regions> ptrs = {};
+          for(auto &ptr: ptrs) {
+            ptr = first;
+            first += deposit_kernel::num_warps(blockDim.x, warpSize);
+          }
+
+          return ptrs;
+        }();
+
+      static constexpr value_type zero = value_type { 0 };
+      static constexpr Vec3v zero_vec  = Vec3v { zero, zero, zero };
+
+      const auto u =
+        Vec3v(im_alive ? vel_mds[idx] : zero_vec).template as<value_type>();
+      const auto invgam =
+        value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
+      const auto x2 =
+        Vec3v(im_alive ? pos_mds[idx] : zero_vec).template as<value_type>() -
+        Vec3v(lattice_origo_coordinates).template as<value_type>();
+      const auto x1 = x2 - cfl * invgam * u;
+
+      const auto i1 = x1.template as<bound_type>();
+      const auto i2 = x2.template as<bound_type>();
+
+      // Cache the computed/loaded x values in shared memory
+      shared_xs[0][threadIdx.x] = x1[0];
+      shared_xs[1][threadIdx.x] = x1[1];
+      shared_xs[2][threadIdx.x] = x1[2];
+      shared_xs[3][threadIdx.x] = x2[0];
+      shared_xs[4][threadIdx.x] = x2[1];
+      shared_xs[5][threadIdx.x] = x2[2];
+
+      Vec3i aabb_min = { ~0u, ~0u, ~0u };
+      Vec3i aabb_max = { 0u, 0u, 0u };
+      if(im_alive) {
+        for(auto i = 0u; i < 3u; i++) {
+          aabb_min[i] = sstd::min(aabb_min[i], sstd::min(i1[i], i2[i]));
+          aabb_max[i] = sstd::max(aabb_max[i], sstd::max(i1[i], i2[i]));
+        }
+      }
+
+      // Each thread has their own bounding box. Let's bound all the boxes
+      // so there's one block-wide bounding box, which we'll distribute
+      // to each thread.
+
+      // Gather the bounds from the lanes of the warp to lane 0
+      for(auto i = 0u; i < 3u; i++) {
+        aabb_min[i] =
+          deposit_kernel::warp_reduce_to_lane_0(aabb_min[i], sstd::min<bound_type>);
+        aabb_max[i] =
+          deposit_kernel::warp_reduce_to_lane_0(aabb_max[i], sstd::max<bound_type>);
+      }
+
+      const auto wid       = deposit_kernel::warp_id();
+      const auto num_warps = deposit_kernel::num_warps(blockDim.x, warpSize);
+
+      // Lane 0 stores the bounds to scratch memory:
+      if(0 == deposit_kernel::lane_id()) {
+        for(auto i = 0u; i < 3u; i++) {
+          shared_bounds[i][wid]      = aabb_min[i];
+          shared_bounds[i + 3u][wid] = aabb_max[i];
+        }
+      }
+
+      // We've padded the loop counter and not skipping dead particles, so this is safe
+      __syncthreads();
+
+      // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps
+      // need to reduce more than one bound. If there are more than six warps,
+      // the first six warps do the reductions in parallel.
+      for(auto i = wid; i < 6u; i += num_warps) {
+        auto *const bounds = shared_bounds[i];
+        // First three warps reduce minimums, last three maximums
+        bound_type val = bound_type { ~0u };
+        auto f         = sstd::min<bound_type>;
+        if(i >= 3u) {
+          val = bound_type { 0 };
+          f   = sstd::max<bound_type>;
+        }
+
+        // Only lanes with lane id < num_warps read the num_warps values from
+        // scratch
+        if(deposit_kernel::lane_id() < num_warps) {
+          val = bounds[deposit_kernel::lane_id()];
+        }
+
+        // All lanes must participate in the reduction to produce correct values
+        val = deposit_kernel::warp_reduce_to_lane_0(val, f);
+
+        // Lane 0 stores the reduced bound back to scratch.
+        // Store in the same location this warp read from to avoid data races
+        // with other warps.
+        if(0 == deposit_kernel::lane_id()) { bounds[0] = val; }
+      }
+
+      // We've padded the loop counter and not skipping dead particles, so this is safe
+      __syncthreads();
+
+      // Finally, every thread of every warp reads the block-wide bounds
+      // from scratch memory. After this, every thread has the box that bounds
+      // all the points considered by the block.
+      for(auto i = 0u; i < 3u; i++) {
+        aabb_min[i] = shared_bounds[i][0];
+        aabb_max[i] = shared_bounds[i + 3u][0];
+      }
+
+      // Fit the block-wide bounding box to the max_capacity of scratch
+      if(im_alive) {
+        auto extent = aabb_max - aabb_min + Vec3i { 2u, 2u, 2u };
+        const auto max_capacity =
+          deposit_kernel::max_capacity_of_memory_for_type<value_type>(
+            std::span<std::byte>(scratch, num_shared_bytes));
+
+        // We'll be storing three boxes in the same volume, because we'll be
+        // storing a current of Vec3 in the same scratch memory.
+        // This may reduce one dimension to zero, if the scratch space cannot
+        // fit even three values of value_type
+        while(max_capacity < 3u * deposit_kernel::prod(extent)) {
+          const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
+                                                 : (extent[1u] > extent[2u] ? 1u : 2u);
+          extent[i] -= 1u;
+        }
+
+        aabb_max = aabb_min + extent;
+      }
+
+      // Return the cached x1 and x2 values and the computed bounds
+      return std::make_tuple(
+        Vec3v {
+          shared_xs[0][threadIdx.x],
+          shared_xs[1][threadIdx.x],
+          shared_xs[2][threadIdx.x],
+        },
+        Vec3v {
+          shared_xs[3][threadIdx.x],
+          shared_xs[4][threadIdx.x],
+          shared_xs[5][threadIdx.x],
+        },
+        aabb_min,
+        aabb_max);
     };
 
-    static constexpr value_type zero = value_type { 0 };
-    static constexpr Vec3v zero_vec  = Vec3v { zero, zero, zero };
-
-    const auto u = Vec3v(idx < vel_mds.size() ? vel_mds[idx] : zero_vec).template as<value_type>();
-    const auto invgam =
-      value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
-    const auto x2 =
-      Vec3v(idx < pos_mds.size() ? pos_mds[idx] : zero_vec).template as<value_type>() -
-      Vec3v(lattice_origo_coordinates).template as<value_type>();
-    const auto x1 = x2 - cfl * invgam * u;
-
-    // Cache the computed/loaded x values in shared memory
-    shared_xs[0][threadIdx.x] = x1[0];
-    shared_xs[1][threadIdx.x] = x1[1];
-    shared_xs[2][threadIdx.x] = x1[2];
-    shared_xs[3][threadIdx.x] = x2[0];
-    shared_xs[4][threadIdx.x] = x2[1];
-    shared_xs[5][threadIdx.x] = x2[2];
-
-    const auto i1 = x1.template as<bound_type>();
-    const auto i2 = x2.template as<bound_type>();
-
-    Vec3i aabb_min = { ~0u, ~0u, ~0u };
-    Vec3i aabb_max = { 0u, 0u, 0u };
-
-    if(guarded_access(ids_mds, runko::dead_prtc_id) != runko::dead_prtc_id) {
-      // Only replace the reduction identities if we're dealing with a live particle
-      for(auto i = 0u; i < 3u; i++) {
-        aabb_min[i] = sstd::min(aabb_min[i], sstd::min(i1[i], i2[i]));
-        aabb_max[i] = sstd::max(aabb_max[i], sstd::max(i1[i], i2[i]));
-      }
-    }
-
-    // Each thread has their own bounding box. Let's bound all the boxes
-    // so there's one block-wide bounding box, which we'll distribute
-    // to each thread.
-
-    // Gather the bounds from the lanes of the warp to lane 0
-    for(auto i = 0u; i < 3u; i++) {
-      aabb_min[i] =
-        deposit_kernel::warp_reduce_to_lane_0(aabb_min[i], sstd::min<bound_type>);
-      aabb_max[i] =
-        deposit_kernel::warp_reduce_to_lane_0(aabb_max[i], sstd::max<bound_type>);
-    }
-
-    const auto wid       = deposit_kernel::warp_id();
-    const auto num_warps = deposit_kernel::num_warps(blockDim.x, warpSize);
-
-    // Lane 0 stores the bounds to scratch memory:
-    if(0 == deposit_kernel::lane_id()) {
-      for(auto i = 0u; i < 3u; i++) {
-        shared_bounds[i][wid]      = aabb_min[i];
-        shared_bounds[i + 3u][wid] = aabb_max[i];
-      }
+    [[maybe_unused]] const auto [x1, x2, aabb_min, aabb_max] = positions_and_bounds();
+    auto box = deposit_kernel::reinterpret_span_or_empty<value_type, std::byte>(
+      std::span<std::byte>(scratch, num_shared_bytes));
+    // Threads of the block loop over the box and set the values to zero
+    for(auto i = threadIdx.x; i < box.size(); i += blockDim.x) {
+      // operator[] of span does bounds checking with a host function
+      box.data()[i] = value_type { 0u };
     }
 
     __syncthreads();
-
-    // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps
-    // need to reduce more than one bound. If there are more than six warps,
-    // the first six warps do the reductions in parallel.
-    for(auto i = wid; i < 6u; i += num_warps) {
-      auto *const bounds = shared_bounds[i];
-      // First three warps reduce minimums, last three maximums
-      bound_type val = bound_type { ~0u };
-      auto f         = sstd::min<bound_type>;
-      if(i >= 3u) {
-        val = bound_type { 0 };
-        f   = sstd::max<bound_type>;
-      }
-
-      // Only lanes with lane id < num_warps read the num_warps values from
-      // scratch
-      if(deposit_kernel::lane_id() < num_warps) {
-        val = bounds[deposit_kernel::lane_id()];
-      }
-
-      // All lanes must participate in the reduction to produce correct values
-      val = deposit_kernel::warp_reduce_to_lane_0(val, f);
-
-      // Lane 0 stores the reduced bound back to scratch.
-      // Store in the same location this warp read from to avoid data races
-      // with other warps.
-      if(0 == deposit_kernel::lane_id()) { bounds[0] = val; }
-    }
-
-    __syncthreads();
-
-    // Finally, every thread of every warp reads the block-wide bounds
-    // from scratch memory. After this, every thread has the box that bounds
-    // all the points considered by the block.
-    for(auto i = 0u; i < 3u; i++) {
-      aabb_min[i] = shared_bounds[i][0];
-      aabb_max[i] = shared_bounds[i + 3u][0];
-    }
-
-    // Need to keep in mind we might be working with idx values that are larger than the
-    // data size!
   }
 }
 }  // namespace pic
@@ -320,40 +364,6 @@ __global__ void
 //     }
 //
 //     return contained;
-//   }
-//
-//   __forceinline__ __device__ void bound_thread_boxes(Scratch scratch)
-//   {
-//   }
-//
-//   __forceinline__ __device__ std::size_t fit_to_scratch(Scratch scratch)
-//   {
-//     // The box is large enough to bound all the particles.
-//     // It may be too large to fit into scratch memory, so it may have to
-//     // be shrunk. We do that here.
-//
-//     // Increase size by two:
-//     // If all the particles are in the same cell, the min and max bounds are
-//     // the same. To make the upper bound strictly larger than any of the
-//     // particle positions, increase it by one. The other one comes from the
-//     // stencil operation to the J grid: we'll be adding current to the
-//     // neighbouring cells in the positive directions, so we'll increase the
-//     // size in each dimension by one.
-//     extent          = extent + Vec3i { 2u, 2u, 2u };
-//     auto volume     = deposit_kernel::prod(extent);
-//     const auto size = scratch.size<bound_type>();
-//
-//     // We'll be storing three boxes in the same volume, because we'll be
-//     // storing a current of Vec3 in the same scratch memory.
-//     while(size < 3u * volume) {
-//       const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
-//                                              : (extent[1u] > extent[2u] ? 1u : 2u);
-//       extent[i] -= 1u;
-//       volume = deposit_kernel::prod(extent);
-//     }
-//
-//     const auto count = 3u * volume;
-//     return count;
 //   }
 //
 //   __forceinline__ __device__ void
@@ -419,23 +429,6 @@ __global__ void
 //{
 //   using Vec3v = toolbox::Vec3<value_type>;
 //
-//   // If num_box_candidates is smaller than the chunk size, we'll construct
-//   // the bounding box considering only a part of the particles in the chunk.
-//   const auto count                = sstd::min(chunk_size, num_box_candidates);
-//   const auto [aabb_min, aabb_max] = compute_thread_bounds(
-//     cfl,
-//     chunk_offset,
-//     count,
-//     ids_mds,
-//     vel_mds,
-//     pos_mds,
-//     lattice_origo_coordinates);
-//
-//   Scratch scratch = { scratch_memory };
-//   [aabb_min]      = bound_thread_boxes(scratch);
-//
-//   Box<value_type> box(aabb_min, aabb_max);
-//   const auto new_size = box.fit_to_scratch(scratch);
 //   scratch.resize<value_type>(new_size);
 //   scratch.set_to_zero();
 //
