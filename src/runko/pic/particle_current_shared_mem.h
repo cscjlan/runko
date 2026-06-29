@@ -173,14 +173,31 @@ __global__ void
 
   const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
   const auto stride = blockDim.x * gridDim.x;
-  for(auto idx = tid; idx < ids_mds.size(); idx += stride) {
+  // The warp reductions inside won't work if length of data is not
+  // a multiple of warpSize, because the last threads of the last warp will not execute
+  // the loop bode. Thus, we must loop over a length that is a multiple of the warpSize
+  // and guard data access if the index is out of range.
+  const auto misalignment = ids_mds.size() & (warpSize - 1ul);
+  const auto end =
+    misalignment > 0ul ? ids_mds.size() + warpSize - misalignment : ids_mds.size();
+
+  for(auto idx = tid; idx < end; idx += stride) {
     // N.B. Must not use continue to skip dead particles before
     // we're done with warp reductions. Otherwise they can produce garbage
-    const auto u = Vec3v(vel_mds[idx]).template as<value_type>();
+
+    auto guarded_access = [&](auto mds, auto otherwise) {
+      return idx < mds.size() ? mds[idx][] : otherwise;
+    };
+
+    static constexpr value_type zero = value_type { 0 };
+    static constexpr Vec3v zero_vec  = Vec3v { zero, zero, zero };
+
+    const auto u = Vec3v(idx < vel_mds.size() ? vel_mds[idx] : zero_vec).template as<value_type>();
     const auto invgam =
       value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
-    const auto x2 = Vec3v(pos_mds[idx]).template as<value_type>() -
-                    Vec3v(lattice_origo_coordinates).template as<value_type>();
+    const auto x2 =
+      Vec3v(idx < pos_mds.size() ? pos_mds[idx] : zero_vec).template as<value_type>() -
+      Vec3v(lattice_origo_coordinates).template as<value_type>();
     const auto x1 = x2 - cfl * invgam * u;
 
     // Cache the computed/loaded x values in shared memory
@@ -196,8 +213,9 @@ __global__ void
 
     Vec3i aabb_min = { ~0u, ~0u, ~0u };
     Vec3i aabb_max = { 0u, 0u, 0u };
-    // Only replace the reduction identities if we're dealing with a live particle
-    if(ids_mds[idx][] != runko::dead_prtc_id) {
+
+    if(guarded_access(ids_mds, runko::dead_prtc_id) != runko::dead_prtc_id) {
+      // Only replace the reduction identities if we're dealing with a live particle
       for(auto i = 0u; i < 3u; i++) {
         aabb_min[i] = sstd::min(aabb_min[i], sstd::min(i1[i], i2[i]));
         aabb_max[i] = sstd::max(aabb_max[i], sstd::max(i1[i], i2[i]));
@@ -233,6 +251,7 @@ __global__ void
     // need to reduce more than one bound. If there are more than six warps,
     // the first six warps do the reductions in parallel.
     for(auto i = wid; i < 6u; i += num_warps) {
+      auto *const bounds = shared_bounds[i];
       // First three warps reduce minimums, last three maximums
       bound_type val = bound_type { ~0u };
       auto f         = sstd::min<bound_type>;
@@ -244,7 +263,7 @@ __global__ void
       // Only lanes with lane id < num_warps read the num_warps values from
       // scratch
       if(deposit_kernel::lane_id() < num_warps) {
-        val = shared_bounds[i][deposit_kernel::lane_id()];
+        val = bounds[deposit_kernel::lane_id()];
       }
 
       // All lanes must participate in the reduction to produce correct values
@@ -253,7 +272,7 @@ __global__ void
       // Lane 0 stores the reduced bound back to scratch.
       // Store in the same location this warp read from to avoid data races
       // with other warps.
-      if(0 == deposit_kernel::lane_id()) { shared_bounds[i][0] = val; }
+      if(0 == deposit_kernel::lane_id()) { bounds[0] = val; }
     }
 
     __syncthreads();
@@ -265,6 +284,9 @@ __global__ void
       aabb_min[i] = shared_bounds[i][0];
       aabb_max[i] = shared_bounds[i + 3u][0];
     }
+
+    // Need to keep in mind we might be working with idx values that are larger than the
+    // data size!
   }
 }
 }  // namespace pic
