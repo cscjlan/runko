@@ -3,23 +3,16 @@
 
 #pragma once
 
-#include "runko/emf/yee_lattice.h"
 #include "runko/pic/particle.h"
 #include "runko/tools/math.h"
 #include "runko/tools/vector.h"
-#include "thrust/device_vector.h"
-#include "thrust/execution_policy.h"
-#include "thrust/iterator/transform_output_iterator.h"
-#include "thrust/memory.h"
-#include "thrust/reduce.h"
-#include "thrust/sort.h"
-#include "tyvi/mdgrid.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <hip/hip_runtime.h>
 #include <iterator>
 #include <limits>
 #include <span>
@@ -28,189 +21,78 @@
 #include <utility>
 #include <variant>
 
-#if defined(TYVI_BACKEND_HIP)
-  #include "hip/hip_runtime.h"
-  #define GLOBAL __global__
-  #define DEVICE __device__
-  #define SHARED __shared__
-  #define INLINE __forceinline__
-#else
-  #define GLOBAL
-  #define DEVICE
-  #define SHARED
-  #define INLINE inline
-#endif
-
-// Claude, here's some guides for you.
-// Assumptions:
-// - value_type = float
-// - runko::dead_prtc_id == maximum value of std::uint64_t
-//
-// Write the following tests for GPU (assume MI250X).
-// Use boost ut.h testing framework.
-// 1. Compare detail::shfl_down to the intrinsic __shfl_down
-// 2. Test detail::num_warps for different block sizes
-// 3. Test detail::wid for different block sizes, always less than num_warps
-// 4. Test detail::lid is always below detail::wsz and values are different
-// 5. Test that make_aligned_span returns a span, the pointer of which is aligned
-//    correctly for that type. Test multiple types.
-// 6. Test that warp_reduce correctly reduces for different functions
-//    test multiple binary functions: min, max, add, sub, mul, div and so on
-// 7. Scratch:
-//    - Test all the functions in scratch with different types and different arguments
-// 8. Box:
-//    Assume all points coordinates are non-negative
-//    Test all the functions. Use scratches of different sizes in range [24 * 4, 32000]
-//    bytes.
-// 9. Check prod computes the product of a vector correctly
-// 10. Don't write tests for the three last functions:
-//     - compute_thread_bounds
-//     - deposit_current
-//     - deposit_current_kernel
-
 namespace detail {
-#if defined(TYVI_BACKEND_HIP)
-INLINE DEVICE void
-  syncthreads()
-{
-  __syncthreads();
-}
-
-template<typename T, typename I>
-INLINE DEVICE T
-  shfl_down(T a, I src)
-{
-  return __shfl_down(a, src);
-}
-
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   gdim()
 {
   return gridDim.x;
 }
 
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   bdim()
 {
   return blockDim.x;
 }
 
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   wsz()
 {
   return warpSize;
 }
 
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   num_warps()
 {
-  return bdim() / wsz();
+  // Warp size is assumed to always be a power of two.
+  // For Nvidia it's 32, for AMD 32 or 64.
+  const bool even_multiple_of_warp_size = (bdim() & (wsz() - 1u)) == 0u;
+  const std::uint32_t warps_per_block   = bdim() / wsz();
+  return even_multiple_of_warp_size ? warps_per_block : warps_per_block + 1u;
 }
 
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   bid()
 {
   return blockIdx.x;
 }
 
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   tid()
 {
   return threadIdx.x;
 }
 
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   wid()
 {
   return tid() / wsz();
 }
 
-INLINE DEVICE std::uint32_t
+__forceinline__ __device__ std::uint32_t
   lid()
 {
   return tid() & (wsz() - 1u);
 }
-#else
-INLINE DEVICE void
-  syncthreads()
-{
-  return;
-}
-
-template<typename T, typename I>
-INLINE DEVICE T
-  shfl_down(T a, I)
-{
-  return a;
-}
-
-INLINE DEVICE std::uint32_t
-  gdim()
-{
-  return 1u;
-}
-
-INLINE DEVICE std::uint32_t
-  bdim()
-{
-  return 1u;
-}
-
-INLINE DEVICE std::uint32_t
-  wsz()
-{
-  return 1u;
-}
-
-INLINE DEVICE std::uint32_t
-  num_warps()
-{
-  return bdim() / wsz();
-}
-
-INLINE DEVICE std::uint32_t
-  bid()
-{
-  return 0u;
-}
-
-INLINE DEVICE std::uint32_t
-  tid()
-{
-  return 0u;
-}
-
-INLINE DEVICE std::uint32_t
-  wid()
-{
-  return tid() / wsz();
-}
-
-INLINE DEVICE std::uint32_t
-  lid()
-{
-  return tid() & (wsz() - 1u);
-}
-#endif
 }  // namespace detail
 
 namespace pic {
 using Vec3i = toolbox::Vec3<std::uint32_t>;
 
 template<typename T, typename F>
-INLINE DEVICE T
-  warp_reduce(T t, F f)
+__forceinline__ __device__ T
+  warp_reduce_to_lane_0(T t, F f)
 {
+    // Only lane 0 will contain the reduced value
 #pragma unroll
   for(auto src_lane = detail::wsz() / 2u; src_lane >= 1u; src_lane /= 2u) {
-    t = f(t, detail::shfl_down(t, src_lane));
+    t = f(t, __shfl_down(t, src_lane));
   }
 
   return t;
 }
 
 template<typename T>
-INLINE DEVICE T
+__forceinline__ __device__ T
   prod(const toolbox::Vec3<T>& v)
 {
   return v[0] * v[1] * v[2];
@@ -221,7 +103,7 @@ private:
   std::span<std::byte> scratch;
 
   template<typename T>
-  INLINE DEVICE decltype(auto) padding_to_alignment() const
+  __forceinline__ __device__ decltype(auto) padding_to_alignment() const
   {
     static constexpr auto alignment = std::alignment_of_v<T>;
     const auto address              = reinterpret_cast<std::uintptr_t>(scratch.data());
@@ -233,39 +115,39 @@ private:
 
 public:
   template<typename T>
-  INLINE DEVICE T* data()
+  __forceinline__ __device__ T* data()
   {
     return static_cast<T*>(
       static_cast<void*>(scratch.data() + padding_to_alignment<T>()));
   }
 
   template<typename T>
-  INLINE DEVICE const T* data() const
+  __forceinline__ __device__ const T* data() const
   {
     return static_cast<const T*>(
       static_cast<const void*>(scratch.data() + padding_to_alignment<T>()));
   }
 
   template<typename T>
-  INLINE DEVICE T& at(std::size_t i)
+  __forceinline__ __device__ T& at(std::size_t i)
   {
     return data<T>()[i];
   }
 
   template<typename T>
-  INLINE DEVICE const T& at(std::size_t i) const
+  __forceinline__ __device__ const T& at(std::size_t i) const
   {
     return data<T>()[i];
   }
 
   template<typename T>
-  INLINE DEVICE std::size_t size() const
+  __forceinline__ __device__ std::size_t size() const
   {
     return (scratch.size() - padding_to_alignment<T>()) / sizeof(T);
   }
 
   template<typename T>
-  INLINE DEVICE void resize(std::size_t i)
+  __forceinline__ __device__ void resize(std::size_t i)
   {
     std::byte* end = static_cast<std::byte*>(static_cast<void*>(data<T>() + i));
     scratch        = std::span<std::byte>(
@@ -273,12 +155,12 @@ public:
       static_cast<std::size_t>(end - scratch.data()));
   }
 
-  INLINE DEVICE void set_to_zero()
+  __forceinline__ __device__ void set_to_zero()
   {
     for(auto i = detail::tid(); i < scratch.size(); i += detail::bdim()) {
       scratch.data()[i] = std::byte { 0 };
     }
-    detail::syncthreads();
+    __syncthreads();
   }
 };
 
@@ -297,13 +179,13 @@ struct Box {
   // Once we're done with reducing them, start using extent.
   // Have them in the "higher" level function, and implement these
   // box functions as free functions or lambdas.
-  DEVICE INLINE Box(const Vec3i& aabb_min, const Vec3i& aabb_max) :
+  __forceinline__ __device__ Box(const Vec3i& aabb_min, const Vec3i& aabb_max) :
     min(aabb_min),
     extent(aabb_max - min)
   {
   }
 
-  DEVICE INLINE bool contains(const Vec3i& point) const
+  __forceinline__ __device__ bool contains(const Vec3i& point) const
   {
     bool contained = true;
 #pragma unroll
@@ -314,7 +196,7 @@ struct Box {
     return contained;
   }
 
-  DEVICE INLINE void bound_thread_boxes(Scratch scratch)
+  __forceinline__ __device__ void bound_thread_boxes(Scratch scratch)
   {
     // Each thread has their own bounding box. This function
     // bounds all the individual bounding boxes to a block-wide bounding box,
@@ -324,9 +206,8 @@ struct Box {
     Vec3i aabb_max = min + extent;
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
-      // Only lane 0 contains the reduced value
-      min[i]      = warp_reduce(min[i], sstd::min<std::uint32_t>);
-      aabb_max[i] = warp_reduce(aabb_max[i], sstd::max<std::uint32_t>);
+      min[i]      = warp_reduce_to_lane_0(min[i], sstd::min<std::uint32_t>);
+      aabb_max[i] = warp_reduce_to_lane_0(aabb_max[i], sstd::max<std::uint32_t>);
     }
 
     // Lane 0 stores the bounds to scratch memory:
@@ -343,7 +224,7 @@ struct Box {
       }
     }
 
-    detail::syncthreads();
+    __syncthreads();
 
     // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps
     // need to reduce more than one bound. If there are more than six warps,
@@ -363,7 +244,7 @@ struct Box {
       // num_warps lanes. This assumes num_warps is a power of two.
       // N.B. block size must be warpSize * 2^k
       for(auto j = detail::num_warps() / 2u; j >= 1u; j /= 2u) {
-        val = f(val, detail::shfl_down(val, j));
+        val = f(val, __shfl_down(val, j));
       }
 
       // Lane 0 stores the reduced bound back to scratch.
@@ -374,7 +255,7 @@ struct Box {
       }
     }
 
-    detail::syncthreads();
+    __syncthreads();
 
     // Finally, every thread of every warp reads the block-global bounds
     // from scratch memory. After this, every thread has the box that bounds
@@ -388,7 +269,7 @@ struct Box {
     extent = aabb_max - min;
   }
 
-  DEVICE INLINE std::size_t fit_to_scratch(Scratch scratch)
+  __forceinline__ __device__ std::size_t fit_to_scratch(Scratch scratch)
   {
     // The box is large enough to bound all the particles.
     // It may be too large to fit into scratch memory, so it may have to
@@ -418,7 +299,7 @@ struct Box {
     return count;
   }
 
-  DEVICE INLINE void
+  __forceinline__ __device__ void
     store(const Vec3i& point, const toolbox::Vec3<value_type>& current, Scratch scratch)
   {
     const auto num_cells_per_component = scratch.size<value_type>() / 3u;
@@ -433,7 +314,7 @@ struct Box {
   }
 
   template<typename JMDS>
-  DEVICE INLINE void copy_from_shared_to_global(JMDS Jmds, Scratch scratch)
+  __forceinline__ __device__ void copy_from_shared_to_global(JMDS Jmds, Scratch scratch)
   {
     const auto num_cells_per_component = scratch.size<value_type>() / 3u;
     for(auto shmem_idx = detail::tid(); shmem_idx < num_cells_per_component;
@@ -457,12 +338,12 @@ struct Box {
       }
     }
 
-    detail::syncthreads();
+    __syncthreads();
   }
 };
 
 template<typename value_type, typename VMDS, typename IMDS>
-DEVICE INLINE std::pair<Vec3i, Vec3i>
+__forceinline__ __device__ std::pair<Vec3i, Vec3i>
   compute_thread_bounds(
     const value_type cfl,
     std::uint32_t offset,
@@ -500,7 +381,7 @@ DEVICE INLINE std::pair<Vec3i, Vec3i>
 }
 
 template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
-DEVICE void
+__device__ void
   deposit_current(
     std::uint32_t num_box_candidates,
     std::uint32_t chunk_offset,
@@ -529,7 +410,7 @@ DEVICE void
     lattice_origo_coordinates);
 
   Scratch scratch = { scratch_memory };
-  [aabb_min] = bound_thread_boxes(scratch);
+  [aabb_min]      = bound_thread_boxes(scratch);
 
   Box<value_type> box(aabb_min, aabb_max);
   const auto new_size = box.fit_to_scratch(scratch);
@@ -635,7 +516,7 @@ DEVICE void
     store_current(i2 + Vec3i(1, 1, 0), Vec3v(0, 0, Fz2 * Wx2 * Wy2));
   }
 
-  detail::syncthreads();
+  __syncthreads();
 
   box.copy_from_shared_to_global(Jmds, scratch);
 }
