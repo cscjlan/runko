@@ -118,13 +118,13 @@ using Vec3 = toolbox::Vec3<T>;
 template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
 __global__ void
   deposit_current_kernel(
-    [[maybe_unused]] std::size_t num_shared_bytes,
+    std::size_t num_shared_bytes,
     const value_type cfl,
-    const value_type,
+    const value_type charge,
     IMDS ids_mds,
     VMDS vel_mds,
     VMDS pos_mds,
-    JMDS,
+    JMDS Jmds,
     const std::array<value_type, 3> lattice_origo_coordinates)
 {
   using Vec3v = Vec3<value_type>;
@@ -321,267 +321,159 @@ __global__ void
         aabb_max);
     };
 
-    [[maybe_unused]] const auto [x1, x2, aabb_min, aabb_max] = positions_and_bounds();
-    auto box = deposit_kernel::reinterpret_span_or_empty<value_type, std::byte>(
+    const auto [x1, x2, aabb_min, aabb_max] = positions_and_bounds();
+
+    // Create value_type span viewing shared memory for storing the currents
+    auto vt_span = deposit_kernel::reinterpret_span_or_empty<value_type, std::byte>(
       std::span<std::byte>(scratch, num_shared_bytes));
-    // Threads of the block loop over the box and set the values to zero
-    for(auto i = threadIdx.x; i < box.size(); i += blockDim.x) {
+
+    // Threads of the block loop over the vt_span and set the values to zero
+    for(auto i = threadIdx.x; i < vt_span.size(); i += blockDim.x) {
       // operator[] of span does bounds checking with a host function
-      box.data()[i] = value_type { 0u };
+      vt_span.data()[i] = value_type { 0u };
     }
 
+    // In positions_and_bounds we've decreased the aabb_max until the bounds
+    // fit within the available shared memory.
+    const std::array<value_type *, 3ul> shared_Js = {
+      vt_span.data(),
+      vt_span.data() + vt_span.size() / 3ul,
+      vt_span.data() + 2ul * (vt_span.size() / 3ul),
+    };
+
+    const auto extent        = im_alive ? aabb_max - aabb_min : Vec3i { 0u, 0u, 0u };
+    const auto store_current = [&](const Vec3i &point, const Vec3v &current) {
+      auto contained = [&](auto point) {
+        bool contained = true;
+        for(auto i = 0u; i < 3u; i++) {
+          contained &= aabb_min[i] <= point[i] && point[i] < aabb_min[i] + extent[i];
+        }
+
+        return contained;
+      };
+
+      auto store = [&](auto point, auto current) {
+        const auto delta = point - aabb_min;
+        const auto idx =
+          delta[2] + delta[1] * extent[2] + delta[0] * extent[1] * extent[2];
+        for(auto i = 0u; i < 3u; i++) {
+          sstd::atomic_add(&shared_Js[i][idx], current[i]);
+        }
+      };
+
+      if(contained(point)) {
+        store(point, current);
+      } else {
+        const auto si  = point.template as<runko::index_t>();
+        auto *const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
+        auto *const Jy = &thrust::raw_reference_cast(Jmds[si.data][1]);
+        auto *const Jz = &thrust::raw_reference_cast(Jmds[si.data][2]);
+
+        sstd::atomic_add(Jx, current[0]);
+        sstd::atomic_add(Jy, current[1]);
+        sstd::atomic_add(Jz, current[2]);
+      }
+    };
+
+    // Float floor for relay and weight computation (pure float — no 64-bit
+    // integers)
+    const auto fi1 = Vec3v(sstd::floor(x1(0)), sstd::floor(x1(1)), sstd::floor(x1(2)));
+    const auto fi2 = Vec3v(sstd::floor(x2(0)), sstd::floor(x2(1)), sstd::floor(x2(2)));
+
+    const auto relay = [&](const runko::index_t j) -> value_type {
+      const auto a  = sstd::min(fi1(j), fi2(j)) + value_type { 1 };
+      const auto b1 = sstd::max(fi1(j), fi2(j));
+      const auto b2 = value_type { 0.5 } * (x1(j) + x2(j));
+      const auto b  = sstd::max(b1, b2);
+      return sstd::min(a, b);
+    };
+
+    const auto x_relay = Vec3v(relay(0), relay(1), relay(2));
+
+    const auto F1 = charge * (x_relay - x1);
+    const auto F2 = charge * (x2 - x_relay);
+
+    const auto i1 = fi1.template as<uint32_t>();
+    const auto i2 = fi2.template as<uint32_t>();
+
+    const auto W1 = value_type { 0.5 } * (x1 + x_relay) - fi1;
+    const auto W2 = value_type { 0.5 } * (x2 + x_relay) - fi2;
+
+    const auto [Fx1, Fy1, Fz1] = F1.data;
+    const auto [Fx2, Fy2, Fz2] = F2.data;
+    const auto [Wx1, Wy1, Wz1] = W1.data;
+    const auto [Wx2, Wy2, Wz2] = W2.data;
+
+    static constexpr auto one = value_type { 1 };
+
+    // Earlier we zerods the shared memory through vt_span.
+    // We must synchronize all threads before we start storing there.
+    __syncthreads();
+
+    if(im_alive) {
+      store_current(
+        i1,
+        Vec3v(
+          Fx1 * (one - Wy1) * (one - Wz1),
+          Fy1 * (one - Wx1) * (one - Wz1),
+          Fz1 * (one - Wx1) * (one - Wy1)));
+      store_current(
+        i2,
+        Vec3v(
+          Fx2 * (one - Wy2) * (one - Wz2),
+          Fy2 * (one - Wx2) * (one - Wz2),
+          Fz2 * (one - Wx2) * (one - Wy2)));
+      store_current(
+        i1 + Vec3i(1, 0, 0),
+        Vec3v(0, Fy1 * Wx1 * (one - Wz1), Fz1 * Wx1 * (one - Wy1)));
+      store_current(
+        i2 + Vec3i(1, 0, 0),
+        Vec3v(0, Fy2 * Wx2 * (one - Wz2), Fz2 * Wx2 * (one - Wy2)));
+      store_current(
+        i1 + Vec3i(0, 1, 0),
+        Vec3v(Fx1 * Wy1 * (one - Wz1), 0, Fz1 * (one - Wx1) * Wy1));
+      store_current(
+        i2 + Vec3i(0, 1, 0),
+        Vec3v(Fx2 * Wy2 * (one - Wz2), 0, Fz2 * (one - Wx2) * Wy2));
+      store_current(
+        i1 + Vec3i(0, 0, 1),
+        Vec3v(Fx1 * (one - Wy1) * Wz1, Fy1 * (one - Wx1) * Wz1, 0));
+      store_current(
+        i2 + Vec3i(0, 0, 1),
+        Vec3v(Fx2 * (one - Wy2) * Wz2, Fy2 * (one - Wx2) * Wz2, 0));
+      store_current(i1 + Vec3i(0, 1, 1), Vec3v(Fx1 * Wy1 * Wz1, 0, 0));
+      store_current(i2 + Vec3i(0, 1, 1), Vec3v(Fx2 * Wy2 * Wz2, 0, 0));
+      store_current(i1 + Vec3i(1, 0, 1), Vec3v(0, Fy1 * Wx1 * Wz1, 0));
+      store_current(i2 + Vec3i(1, 0, 1), Vec3v(0, Fy2 * Wx2 * Wz2, 0));
+      store_current(i1 + Vec3i(1, 1, 0), Vec3v(0, 0, Fz1 * Wx1 * Wy1));
+      store_current(i2 + Vec3i(1, 1, 0), Vec3v(0, 0, Fz2 * Wx2 * Wy2));
+    }
+
+    // Wait until all threads are done with storing values.
+    __syncthreads();
+
+    // Move from shared memory to global
+    const auto volume = deposit_kernel::prod(extent);
+    for(auto shmem_idx = threadIdx.x; shmem_idx < volume; shmem_idx += blockDim.x) {
+      const auto si = (Vec3i { shmem_idx / (extent[1] * extent[2]),
+                               (shmem_idx / extent[2]) % extent[1],
+                               shmem_idx % extent[2] } +
+                       aabb_min)
+                        .template as<runko::index_t>();
+      value_type *const J[3] = {
+        &thrust::raw_reference_cast(Jmds[si.data][0]),
+        &thrust::raw_reference_cast(Jmds[si.data][1]),
+        &thrust::raw_reference_cast(Jmds[si.data][2]),
+      };
+
+      for(auto i = 0u; i < 3u; i++) {
+        const auto val = shared_Js[i][shmem_idx];
+        if(0 != val) { sstd::atomic_add(J[i], val); }
+      }
+    }
+
+    // Wait until everyone is ready, before moving on
     __syncthreads();
   }
 }
 }  // namespace pic
-//// This assumes cells can never be negative
-// template<typename value_type>
-// struct Box {
-//   Vec3i min    = { ~0u, ~0u, ~0u };
-//   Vec3i extent = { 0u, 0u, 0u };
-//
-//   // TODO:
-//   // Inactive threads have ~0u in min and 0u in max
-//   // extent will then be wrong
-//   // Should also check max >= min, otherwise will underflow
-//   // This should probably be rewritten:
-//   // don't have box, just have aabb_min and aabb_max.
-//   // Once we're done with reducing them, start using extent.
-//   // Have them in the "higher" level function, and implement these
-//   // box functions as free functions or lambdas.
-//   __forceinline__ __device__ Box(const Vec3i& aabb_min, const Vec3i& aabb_max) :
-//     min(aabb_min),
-//     extent(aabb_max - min)
-//   {
-//   }
-//
-//   __forceinline__ __device__ bool contains(const Vec3i& point) const
-//   {
-//     bool contained = true;
-// #pragma unroll
-//     for(auto i = 0u; i < 3u; i++) {
-//       contained &= min[i] <= point[i] && point[i] < min[i] + extent[i];
-//     }
-//
-//     return contained;
-//   }
-//
-//   __forceinline__ __device__ void
-//     store(const Vec3i& point, const toolbox::Vec3<value_type>& current, Scratch
-//     scratch)
-//   {
-//     const auto num_cells_per_component = scratch.size<value_type>() / 3u;
-//     const auto delta                   = point - min;
-//     const auto idx = delta[2] + delta[1] * extent[2] + delta[0] * extent[1] *
-//     extent[2];
-// #pragma unroll
-//     for(auto i = 0u; i < 3u; i++) {
-//       sstd::atomic_add(
-//         &scratch.at<value_type>(idx + i * num_cells_per_component),
-//         current[i]);
-//     }
-//   }
-//
-//   template<typename JMDS>
-//   __forceinline__ __device__ void copy_from_shared_to_global(JMDS Jmds, Scratch
-//   scratch)
-//   {
-//     const auto num_cells_per_component = scratch.size<value_type>() / 3u;
-//     for(auto shmem_idx = deposit_kernel::tid(); shmem_idx < num_cells_per_component;
-//         shmem_idx += deposit_kernel::bdim()) {
-//       const auto si = (Vec3i { shmem_idx / (extent[1] * extent[2]),
-//                                (shmem_idx / extent[2]) % extent[1],
-//                                shmem_idx % extent[2] } +
-//                        min)
-//                         .as<runko::index_t>();
-//       value_type* const J[3] = {
-//         &thrust::raw_reference_cast(Jmds[si.data][0]),
-//         &thrust::raw_reference_cast(Jmds[si.data][1]),
-//         &thrust::raw_reference_cast(Jmds[si.data][2]),
-//       };
-//
-// #pragma unroll
-//       for(auto i = 0u; i < 3u; i++) {
-//         const auto val =
-//           scratch.at<value_type>(shmem_idx + i * num_cells_per_component);
-//         if(0 != val) { sstd::atomic_add(J[i], val); }
-//       }
-//     }
-//
-//     __syncthreads();
-//   }
-// };
-//
-// template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
-//__device__ void
-//   deposit_current(
-//     std::uint32_t num_box_candidates,
-//     std::uint32_t chunk_offset,
-//     std::uint32_t chunk_size,
-//     const value_type cfl,
-//     const value_type charge,
-//     IMDS ids_mds,
-//     VMDS vel_mds,
-//     VMDS pos_mds,
-//     JMDS Jmds,
-//     const std::array<value_type, 3> lattice_origo_coordinates,
-//     std::span<std::byte> scratch_memory)
-//{
-//   using Vec3v = toolbox::Vec3<value_type>;
-//
-//   scratch.resize<value_type>(new_size);
-//   scratch.set_to_zero();
-//
-//   const auto store_current = [&](const Vec3i& point, const Vec3v& current) {
-//     if(box.contains(point)) {
-//       box.store(point, current, scratch);
-//     } else {
-//       const auto si  = point.template as<runko::index_t>();
-//       auto* const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
-//       auto* const Jy = &thrust::raw_reference_cast(Jmds[si.data][1]);
-//       auto* const Jz = &thrust::raw_reference_cast(Jmds[si.data][2]);
-//
-//       sstd::atomic_add(Jx, current[0]);
-//       sstd::atomic_add(Jy, current[1]);
-//       sstd::atomic_add(Jz, current[2]);
-//     }
-//   };
-//
-//   for(auto elem_idx = chunk_offset + deposit_kernel::tid();
-//       elem_idx < chunk_offset + chunk_size;
-//       elem_idx += deposit_kernel::bdim()) {
-//     if(ids_mds[elem_idx][] == runko::dead_prtc_id) { continue; }
-//
-//     const auto u = Vec3v(vel_mds[elem_idx]).template as<value_type>();
-//     const auto invgam =
-//       value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
-//
-//     const auto x2 = Vec3v(pos_mds[elem_idx]).template as<value_type>() -
-//                     Vec3v(lattice_origo_coordinates).template as<value_type>();
-//
-//     const auto x1 = x2 - cfl * invgam * u;
-//
-//     // Float floor for relay and weight computation (pure float — no 64-bit
-//     // integers)
-//     const auto fi1 = Vec3v(sstd::floor(x1(0)), sstd::floor(x1(1)),
-//     sstd::floor(x1(2))); const auto fi2 = Vec3v(sstd::floor(x2(0)),
-//     sstd::floor(x2(1)), sstd::floor(x2(2)));
-//
-//     const auto relay = [&](const runko::index_t j) -> value_type {
-//       const auto a  = sstd::min(fi1(j), fi2(j)) + value_type { 1 };
-//       const auto b1 = sstd::max(fi1(j), fi2(j));
-//       const auto b2 = value_type { 0.5 } * (x1(j) + x2(j));
-//       const auto b  = sstd::max(b1, b2);
-//       return sstd::min(a, b);
-//     };
-//
-//     const auto x_relay = Vec3v(relay(0), relay(1), relay(2));
-//
-//     const auto F1 = charge * (x_relay - x1);
-//     const auto F2 = charge * (x2 - x_relay);
-//
-//     const auto i1 = fi1.template as<uint32_t>();
-//     const auto i2 = fi2.template as<uint32_t>();
-//
-//     const auto W1 = value_type { 0.5 } * (x1 + x_relay) - fi1;
-//     const auto W2 = value_type { 0.5 } * (x2 + x_relay) - fi2;
-//
-//     const auto [Fx1, Fy1, Fz1] = F1.data;
-//     const auto [Fx2, Fy2, Fz2] = F2.data;
-//     const auto [Wx1, Wy1, Wz1] = W1.data;
-//     const auto [Wx2, Wy2, Wz2] = W2.data;
-//
-//     static constexpr auto one = value_type { 1 };
-//
-//     store_current(
-//       i1,
-//       Vec3v(
-//         Fx1 * (one - Wy1) * (one - Wz1),
-//         Fy1 * (one - Wx1) * (one - Wz1),
-//         Fz1 * (one - Wx1) * (one - Wy1)));
-//
-//     store_current(
-//       i2,
-//       Vec3v(
-//         Fx2 * (one - Wy2) * (one - Wz2),
-//         Fy2 * (one - Wx2) * (one - Wz2),
-//         Fz2 * (one - Wx2) * (one - Wy2)));
-//     store_current(
-//       i1 + Vec3i(1, 0, 0),
-//       Vec3v(0, Fy1 * Wx1 * (one - Wz1), Fz1 * Wx1 * (one - Wy1)));
-//     store_current(
-//       i2 + Vec3i(1, 0, 0),
-//       Vec3v(0, Fy2 * Wx2 * (one - Wz2), Fz2 * Wx2 * (one - Wy2)));
-//     store_current(
-//       i1 + Vec3i(0, 1, 0),
-//       Vec3v(Fx1 * Wy1 * (one - Wz1), 0, Fz1 * (one - Wx1) * Wy1));
-//     store_current(
-//       i2 + Vec3i(0, 1, 0),
-//       Vec3v(Fx2 * Wy2 * (one - Wz2), 0, Fz2 * (one - Wx2) * Wy2));
-//     store_current(
-//       i1 + Vec3i(0, 0, 1),
-//       Vec3v(Fx1 * (one - Wy1) * Wz1, Fy1 * (one - Wx1) * Wz1, 0));
-//     store_current(
-//       i2 + Vec3i(0, 0, 1),
-//       Vec3v(Fx2 * (one - Wy2) * Wz2, Fy2 * (one - Wx2) * Wz2, 0));
-//     store_current(i1 + Vec3i(0, 1, 1), Vec3v(Fx1 * Wy1 * Wz1, 0, 0));
-//     store_current(i2 + Vec3i(0, 1, 1), Vec3v(Fx2 * Wy2 * Wz2, 0, 0));
-//     store_current(i1 + Vec3i(1, 0, 1), Vec3v(0, Fy1 * Wx1 * Wz1, 0));
-//     store_current(i2 + Vec3i(1, 0, 1), Vec3v(0, Fy2 * Wx2 * Wz2, 0));
-//     store_current(i1 + Vec3i(1, 1, 0), Vec3v(0, 0, Fz1 * Wx1 * Wy1));
-//     store_current(i2 + Vec3i(1, 1, 0), Vec3v(0, 0, Fz2 * Wx2 * Wy2));
-//   }
-//
-//   __syncthreads();
-//
-//   box.copy_from_shared_to_global(Jmds, scratch);
-// }
-//
-// template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
-//__global__ void
-//   deposit_current_kernel_old(
-//     std::uint32_t num_chunks,
-//     std::uint32_t chunk_size,
-//     std::uint32_t num_shared_bytes,
-//     std::uint32_t num_box_candidates,
-//     const value_type cfl,
-//     const value_type charge,
-//     IMDS ids_mds,
-//     VMDS vel_mds,
-//     VMDS pos_mds,
-//     JMDS Jmds,
-//     const std::array<value_type, 3> lattice_origo_coordinates)
-//{
-//   static_assert(std::is_floating_point_v<value_type>);
-//   extern __shared__ std::byte scratch[];
-//
-//   // At least a 2x2x2 box of Vec3 must fit into scratch
-//   // box creation also uses scratch and requires 6 * num_warps *
-//   // sizeof(bound_type) bytes
-//   assert(num_shared_bytes >= 3u * 2u * 2u * 2u * sizeof(value_type));
-//   assert(num_shared_bytes >= 6u * deposit_kernel::num_warps() * sizeof(bound_type));
-//
-//   std::span<std::byte> scratch_memory(scratch, num_shared_bytes);
-//
-//   // Work over chunks: each block goes over a chunk and chunk size may
-//   // be different from block dimension. There's no point for it being smaller
-//   // but it being larger may be beneficial with large ppc.
-//   // It should be a multiple of block dimension.
-//   for(auto chunk_idx = deposit_kernel::bid(); chunk_idx < num_chunks;
-//       chunk_idx += deposit_kernel::gdim()) {
-//     const auto chunk_offset = chunk_idx * chunk_size;
-//     deposit_current(
-//       num_box_candidates,
-//       chunk_offset,
-//       chunk_size,
-//       cfl,
-//       charge,
-//       ids_mds,
-//       vel_mds,
-//       pos_mds,
-//       Jmds,
-//       lattice_origo_coordinates,
-//       scratch_memory);
-//   }
-// }
-//
