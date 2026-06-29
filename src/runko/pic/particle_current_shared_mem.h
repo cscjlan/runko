@@ -22,7 +22,7 @@
 #include <variant>
 
 namespace deposit_kernel {
-__host__ __device__ decltype(auto)
+__host__ __device__ constexpr std::size_t
   num_warps(std::size_t num_threads, std::size_t warp_size)
 {
   // Warp size is assumed to always be a power of two.
@@ -32,13 +32,13 @@ __host__ __device__ decltype(auto)
   return even_multiple_of_warp_size ? warps_per_block : warps_per_block + 1;
 }
 
-__device__ decltype(auto)
+__device__ std::uint32_t
   warp_id()
 {
   return threadIdx.x / warpSize;
 }
 
-__device__ decltype(auto)
+__device__ std::uint32_t
   lane_id()
 {
   return threadIdx.x & (warpSize - 1);
@@ -49,8 +49,9 @@ __device__ T
   warp_reduce_to_lane_0(T t, F f)
 {
   // Only lane 0 will contain the reduced value
+  // TODO: This'll yield garbage with non-full warps
 #pragma unroll
-  for(auto src_lane = warpSize; src_lane >= 1; src_lane /= 2) {
+  for(auto src_lane = warpSize / 2; src_lane >= 1; src_lane /= 2) {
     t = f(t, __shfl_down(t, src_lane));
   }
 
@@ -68,16 +69,21 @@ template<typename T, typename U>
 __device__ T *
   align_up(U *ptr)
 {
+  // Either both are const or neither are const
+  static_assert(not std::is_const_v<U> || std::is_const_v<T>);
   return reinterpret_cast<T *>(__builtin_align_up(ptr, std::alignment_of_v<T>));
 }
 
 static constexpr std::size_t vt_shared_mem_regions = 6ul;
 static constexpr std::size_t bt_shared_mem_regions = 6ul;
 
-template <typename value_type, typename bound_type>
+template<typename value_type, typename bound_type>
 __host__ __device__ constexpr std::size_t
   shared_mem_requirement(std::size_t num_threads, std::size_t num_warps)
 {
+  // extern __shared__ is guaranteed to align to at least 16 bytes, so no need to align
+  // the value_type when casting from std::byte *.
+  // Only the padding between value_type and bound_type is required.
   static constexpr auto bt_padding = std::alignment_of_v<bound_type> - 1;
   const auto vt_mem = vt_shared_mem_regions * num_threads * sizeof(value_type);
   const auto bt_mem = bt_shared_mem_regions * num_warps * sizeof(bound_type);
@@ -130,6 +136,9 @@ __global__ void
 
   [[maybe_unused]] const std::array<bound_type *, deposit_kernel::bt_shared_mem_regions>
     shared_bounds = [&]() {
+      // We're using the same shared memory arena for value_types and bound_types.
+      // Here we align the memory after the last of value_type to be suitable for
+      // bound_type.
       auto *first =
         deposit_kernel::align_up<bound_type>(shared_xs.back() + shared_xs_stride);
       std::array<bound_type *, deposit_kernel::bt_shared_mem_regions> ptrs = {};
