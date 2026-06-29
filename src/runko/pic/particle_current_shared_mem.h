@@ -21,31 +21,31 @@
 #include <utility>
 #include <variant>
 
-namespace detail {
-__forceinline__ __device__ decltype(auto)
-  num_warps()
+namespace deposit_kernel {
+__host__ __device__ decltype(auto)
+  num_warps(std::size_t num_threads, std::size_t warp_size)
 {
   // Warp size is assumed to always be a power of two.
   // For Nvidia it's 32, for AMD 32 or 64.
-  const bool even_multiple_of_warp_size = (blockDim.x & (warpSize - 1)) == 0;
-  const auto warps_per_block            = blockDim.x / warpSize;
+  const bool even_multiple_of_warp_size = (num_threads & (warp_size - 1)) == 0;
+  const auto warps_per_block            = num_threads / warp_size;
   return even_multiple_of_warp_size ? warps_per_block : warps_per_block + 1;
 }
 
-__forceinline__ __device__ decltype(auto)
+__device__ decltype(auto)
   warp_id()
 {
   return threadIdx.x / warpSize;
 }
 
-__forceinline__ __device__ decltype(auto)
+__device__ decltype(auto)
   lane_id()
 {
   return threadIdx.x & (warpSize - 1);
 }
 
 template<typename T, typename F>
-__forceinline__ __device__ T
+__device__ T
   warp_reduce_to_lane_0(T t, F f)
 {
   // Only lane 0 will contain the reduced value
@@ -58,19 +58,95 @@ __forceinline__ __device__ T
 }
 
 template<typename T>
-__forceinline__ __device__ T
+__device__ T
   prod(const toolbox::Vec3<T> &v)
 {
   return v[0] * v[1] * v[2];
 }
-}  // namespace detail
+
+template<typename T, typename U>
+__device__ T *
+  align_up(U *ptr)
+{
+  return reinterpret_cast<T *>(__builtin_align_up(ptr, std::alignment_of_v<T>));
+}
+
+static constexpr std::size_t vt_shared_mem_regions = 6ul;
+static constexpr std::size_t bt_shared_mem_regions = 6ul;
+
+template <typename value_type, typename bound_type>
+__host__ __device__ constexpr std::size_t
+  shared_mem_requirement(std::size_t num_threads, std::size_t num_warps)
+{
+  static constexpr auto bt_padding = std::alignment_of_v<bound_type> - 1;
+  const auto vt_mem = vt_shared_mem_regions * num_threads * sizeof(value_type);
+  const auto bt_mem = bt_shared_mem_regions * num_warps * sizeof(bound_type);
+  return vt_mem + bt_padding + bt_mem;
+}
+
+}  // namespace deposit_kernel
 
 namespace pic {
 using bound_type = std::uint32_t;
 template<typename T>
 using Vec3 = toolbox::Vec3<T>;
 
-// struct Scratch {
+template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
+__global__ void
+  deposit_current_kernel(
+    [[maybe_unused]] std::size_t num_shared_bytes,
+    const value_type,
+    const value_type,
+    IMDS ids_mds,
+    VMDS,
+    VMDS,
+    JMDS,
+    const std::array<value_type, 3>)
+{
+  extern __shared__ std::byte scratch[];
+
+  // value_type must be a floating point type
+  static_assert(std::is_floating_point_v<value_type>);
+  assert(
+    (num_shared_bytes >= deposit_kernel::shared_mem_requirement<value_type, bound_type>(
+                           blockDim.x,
+                           deposit_kernel::num_warps(blockDim.x, warpSize))));
+
+  // Each thread in the block shares these pointers.
+  // They're used to store the x1 and x2 vectors that will be read from global memory
+  // (pos & vel)
+  const auto shared_xs_stride = blockDim.x;
+  [[maybe_unused]] const std::array<value_type *, deposit_kernel::vt_shared_mem_regions>
+    shared_xs = [&]() {
+      auto *first = deposit_kernel::align_up<value_type>(scratch);
+      std::array<value_type *, deposit_kernel::vt_shared_mem_regions> ptrs = {};
+      for(auto &ptr: ptrs) {
+        ptr = first;
+        first += shared_xs_stride;
+      }
+
+      return ptrs;
+    }();
+
+  [[maybe_unused]] const std::array<bound_type *, deposit_kernel::bt_shared_mem_regions>
+    shared_bounds = [&]() {
+      auto *first =
+        deposit_kernel::align_up<bound_type>(shared_xs.back() + shared_xs_stride);
+      std::array<bound_type *, deposit_kernel::bt_shared_mem_regions> ptrs = {};
+      for(auto &ptr: ptrs) {
+        ptr = first;
+        first += deposit_kernel::num_warps(blockDim.x, warpSize);
+      }
+
+      return ptrs;
+    }();
+
+  const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
+  const auto stride = blockDim.x * gridDim.x;
+  for(auto idx = tid; idx < ids_mds.size(); idx += stride) {}
+}
+}  // namespace pic
+   //// struct Scratch {
 // private:
 //   std::span<std::byte> scratch;
 //
@@ -129,7 +205,8 @@ using Vec3 = toolbox::Vec3<T>;
 //
 //   __forceinline__ __device__ void set_to_zero()
 //   {
-//     for(auto i = detail::tid(); i < scratch.size(); i += detail::bdim()) {
+//     for(auto i = deposit_kernel::tid(); i < scratch.size(); i +=
+//     deposit_kernel::bdim()) {
 //       scratch.data()[i] = std::byte { 0 };
 //     }
 //     __syncthreads();
@@ -178,9 +255,9 @@ using Vec3 = toolbox::Vec3<T>;
 //     Vec3i aabb_max = min + extent;
 // #pragma unroll
 //     for(auto i = 0u; i < 3u; i++) {
-//       min[i] = detail::warp_reduce_to_lane_0(min[i], sstd::min<bound_type>);
+//       min[i] = deposit_kernel::warp_reduce_to_lane_0(min[i], sstd::min<bound_type>);
 //       aabb_max[i] =
-//         detail::warp_reduce_to_lane_0(aabb_max[i], sstd::max<bound_type>);
+//         deposit_kernel::warp_reduce_to_lane_0(aabb_max[i], sstd::max<bound_type>);
 //     }
 //
 //     // Lane 0 stores the bounds to scratch memory:
@@ -188,11 +265,13 @@ using Vec3 = toolbox::Vec3<T>;
 //     // next num_warps values contain min[1] for each warp,
 //     // then min[2],
 //     // then max[0] and so on.
-//     if(0 == detail::lid()) {
+//     if(0 == deposit_kernel::lid()) {
 // #pragma unroll
 //       for(auto i = 0u; i < 3u; i++) {
-//         scratch.at<bound_type>(detail::wid() + i * detail::num_warps()) = min[i];
-//         scratch.at<bound_type>(detail::wid() + (3u + i) * detail::num_warps()) =
+//         scratch.at<bound_type>(deposit_kernel::wid() + i *
+//         deposit_kernel::num_warps()) = min[i];
+//         scratch.at<bound_type>(deposit_kernel::wid() + (3u + i) *
+//         deposit_kernel::num_warps()) =
 //           aabb_max[i];
 //       }
 //     }
@@ -202,29 +281,30 @@ using Vec3 = toolbox::Vec3<T>;
 //     // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps
 //     // need to reduce more than one bound. If there are more than six warps,
 //     // the first six warps do the reductions is parallel.
-//     for(auto i = detail::wid(); i < 6u; i += detail::num_warps()) {
+//     for(auto i = deposit_kernel::wid(); i < 6u; i += deposit_kernel::num_warps()) {
 //       // Each thread participates to avoid deadlock with syncthreads
 //       bound_type val = bound_type {0};
 //
 //       // Only lanes with lane id < num_warps read the num_warps values from
 //       // scratch
-//       if(detail::lid() < detail::num_warps()) {
-//         val = scratch.at<bound_type>(detail::lid() + i * detail::num_warps());
+//       if(deposit_kernel::lid() < deposit_kernel::num_warps()) {
+//         val = scratch.at<bound_type>(deposit_kernel::lid() + i *
+//         deposit_kernel::num_warps());
 //       }
 //       const auto f = i < 3u ? sstd::min<bound_type> : sstd::max<bound_type>;
 //
 //       // All lanes participate, but lane 0 only contains reductions from first
 //       // num_warps lanes. This assumes num_warps is a power of two.
 //       // N.B. block size must be warpSize * 2^k
-//       for(auto j = detail::num_warps() / 2u; j >= 1u; j /= 2u) {
+//       for(auto j = deposit_kernel::num_warps() / 2u; j >= 1u; j /= 2u) {
 //         val = f(val, __shfl_down(val, j));
 //       }
 //
 //       // Lane 0 stores the reduced bound back to scratch.
 //       // Store in the same location this warp read from to avoid data races
 //       // with other warps.
-//       if(0 == detail::lid()) {
-//         scratch.at<bound_type>(i * detail::num_warps()) = val;
+//       if(0 == deposit_kernel::lid()) {
+//         scratch.at<bound_type>(i * deposit_kernel::num_warps()) = val;
 //       }
 //     }
 //
@@ -235,8 +315,8 @@ using Vec3 = toolbox::Vec3<T>;
 //     // all the points considered by the block.
 // #pragma unroll
 //     for(auto i = 0u; i < 3u; i++) {
-//       min[i]      = scratch.at<bound_type>(i * detail::num_warps());
-//       aabb_max[i] = scratch.at<bound_type>((i + 3u) * detail::num_warps());
+//       min[i]      = scratch.at<bound_type>(i * deposit_kernel::num_warps());
+//       aabb_max[i] = scratch.at<bound_type>((i + 3u) * deposit_kernel::num_warps());
 //     }
 //
 //     extent = aabb_max - min;
@@ -256,7 +336,7 @@ using Vec3 = toolbox::Vec3<T>;
 //     // neighbouring cells in the positive directions, so we'll increase the
 //     // size in each dimension by one.
 //     extent          = extent + Vec3i { 2u, 2u, 2u };
-//     auto volume     = detail::prod(extent);
+//     auto volume     = deposit_kernel::prod(extent);
 //     const auto size = scratch.size<bound_type>();
 //
 //     // We'll be storing three boxes in the same volume, because we'll be
@@ -265,7 +345,7 @@ using Vec3 = toolbox::Vec3<T>;
 //       const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
 //                                              : (extent[1u] > extent[2u] ? 1u : 2u);
 //       extent[i] -= 1u;
-//       volume = detail::prod(extent);
+//       volume = deposit_kernel::prod(extent);
 //     }
 //
 //     const auto count = 3u * volume;
@@ -293,8 +373,8 @@ using Vec3 = toolbox::Vec3<T>;
 //   scratch)
 //   {
 //     const auto num_cells_per_component = scratch.size<value_type>() / 3u;
-//     for(auto shmem_idx = detail::tid(); shmem_idx < num_cells_per_component;
-//         shmem_idx += detail::bdim()) {
+//     for(auto shmem_idx = deposit_kernel::tid(); shmem_idx < num_cells_per_component;
+//         shmem_idx += deposit_kernel::bdim()) {
 //       const auto si = (Vec3i { shmem_idx / (extent[1] * extent[2]),
 //                                (shmem_idx / extent[2]) % extent[1],
 //                                shmem_idx % extent[2] } +
@@ -333,8 +413,8 @@ using Vec3 = toolbox::Vec3<T>;
 //
 //   Vec3i aabb_min = { ~0u, ~0u, ~0u };
 //   Vec3i aabb_max = { 0u, 0u, 0u };
-//   for(auto elem_idx = offset + detail::tid(); elem_idx < offset + count;
-//       elem_idx += detail::bdim()) {
+//   for(auto elem_idx = offset + deposit_kernel::tid(); elem_idx < offset + count;
+//       elem_idx += deposit_kernel::bdim()) {
 //     if(ids_mds[elem_idx][] == runko::dead_prtc_id) { continue; }
 //
 //     const auto u = Vec3v(vel_mds[elem_idx]).template as<value_type>();
@@ -408,9 +488,9 @@ using Vec3 = toolbox::Vec3<T>;
 //     }
 //   };
 //
-//   for(auto elem_idx = chunk_offset + detail::tid();
+//   for(auto elem_idx = chunk_offset + deposit_kernel::tid();
 //       elem_idx < chunk_offset + chunk_size;
-//       elem_idx += detail::bdim()) {
+//       elem_idx += deposit_kernel::bdim()) {
 //     if(ids_mds[elem_idx][] == runko::dead_prtc_id) { continue; }
 //
 //     const auto u = Vec3v(vel_mds[elem_idx]).template as<value_type>();
@@ -520,7 +600,7 @@ using Vec3 = toolbox::Vec3<T>;
 //   // box creation also uses scratch and requires 6 * num_warps *
 //   // sizeof(bound_type) bytes
 //   assert(num_shared_bytes >= 3u * 2u * 2u * 2u * sizeof(value_type));
-//   assert(num_shared_bytes >= 6u * detail::num_warps() * sizeof(bound_type));
+//   assert(num_shared_bytes >= 6u * deposit_kernel::num_warps() * sizeof(bound_type));
 //
 //   std::span<std::byte> scratch_memory(scratch, num_shared_bytes);
 //
@@ -528,8 +608,8 @@ using Vec3 = toolbox::Vec3<T>;
 //   // be different from block dimension. There's no point for it being smaller
 //   // but it being larger may be beneficial with large ppc.
 //   // It should be a multiple of block dimension.
-//   for(auto chunk_idx = detail::bid(); chunk_idx < num_chunks;
-//       chunk_idx += detail::gdim()) {
+//   for(auto chunk_idx = deposit_kernel::bid(); chunk_idx < num_chunks;
+//       chunk_idx += deposit_kernel::gdim()) {
 //     const auto chunk_offset = chunk_idx * chunk_size;
 //     deposit_current(
 //       num_box_candidates,
@@ -545,56 +625,4 @@ using Vec3 = toolbox::Vec3<T>;
 //       scratch_memory);
 //   }
 // }
-
-template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
-__global__ void
-  deposit_current_kernel(
-    [[maybe_unused]] std::uint32_t num_shared_bytes,
-    const value_type,
-    const value_type,
-    IMDS ids_mds,
-    VMDS,
-    VMDS,
-    JMDS,
-    const std::array<value_type, 3>)
-{
-  extern __shared__ std::byte scratch[];
-
-  [&]() {
-    // value_type must be a floating point type
-    static_assert(std::is_floating_point_v<value_type>);
-    // value_type size must be larger or equal to bound_type size
-    // makes alignment in shared memory easier
-    static_assert(sizeof(value_type) >= sizeof(bound_type));
-
-    // We need to be able to store the x1 and x2 vec3 values
-    // for each thread,
-    // as well as the 6 bounds (3 for min, 3 for max)
-    // for all warps.
-    [[maybe_unused]] const std::uint32_t shared_mem_requirement =
-      6u * (detail::num_warps() * sizeof(bound_type) + blockDim.x * sizeof(value_type));
-    assert(num_shared_bytes >= shared_mem_requirement);
-  }();
-
-  [[maybe_unused]] auto align_up = []<typename T, typename U>(U *ptr) {
-    return reinterpret_cast<T *>(__builtin_align_up(ptr, std::alignment_of_v<T>));
-  };
-
-  [[maybe_unused]] const std::array<value_type *, 6> shared_x_ptrs = [&]() {
-    std::array<value_type *, 6> ptrs = {
-      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-    };
-    ptrs[0] = align_up.template operator()<value_type>(scratch);
-#pragma unroll
-    for(auto i = 1ul; i < 6ul; i++) {
-      ptrs[i] = align_up.template operator()<value_type>(ptrs[i - 1ul]);
-    }
-
-    return ptrs;
-  }();
-
-  const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
-  const auto stride = blockDim.x * gridDim.x;
-  for(auto idx = tid; idx < ids_mds.size(); idx += stride) {}
-}
-}  // namespace pic
+//

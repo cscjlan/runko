@@ -353,7 +353,28 @@ void
 
   const dim3 threads { 1024, 1, 1 };
   const dim3 blocks { 1024, 1, 1 };
-  static constexpr std::uint32_t num_shared_bytes   = 32u * 1024u;
+
+  auto query_warp_size = []() {
+      // This assumes we're using devices which all have the same warp size
+      static std::size_t warp_size = 0;
+      if (0 == warp_size) {
+        int dev = 0;
+        if (hipGetDevice(&dev) != hipSuccess) {
+            throw std::runtime_error("Failed to get device ordinal");
+        }
+
+        hipDeviceProp_t props;
+        if (hipGetDeviceProperties(&props, dev) != hipSuccess) {
+            throw std::runtime_error("Failed to get device properties");
+        }
+        warp_size = static_cast<std::size_t>(props.warpSize);
+      }
+      return warp_size;
+  };
+
+  const auto num_shared_bytes = deposit_kernel::shared_mem_requirement<value_type, bound_type>(
+                          threads.x,
+                          deposit_kernel::num_warps(threads.x, query_warp_size()));
 
   deposit_current_kernel<<<blocks, threads, num_shared_bytes, 0>>>(
     num_shared_bytes,
