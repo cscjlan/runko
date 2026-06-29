@@ -49,8 +49,8 @@ __device__ T
   warp_reduce_to_lane_0(T t, F f)
 {
   // Only lane 0 will contain the reduced value
-  // TODO: This'll yield garbage with non-full warps
-#pragma unroll
+  // N.B. Every lane must participate in this!
+  // If some lanes are inactive, this'll produce incorrect results.
   for(auto src_lane = warpSize / 2; src_lane >= 1; src_lane /= 2) {
     t = f(t, __shfl_down(t, src_lane));
   }
@@ -81,15 +81,26 @@ template<typename value_type, typename bound_type>
 __host__ __device__ constexpr std::size_t
   shared_mem_requirement(std::size_t num_threads, std::size_t num_warps)
 {
-  // extern __shared__ is guaranteed to align to at least 16 bytes, so no need to align
-  // the value_type when casting from std::byte *.
-  // Only the padding between value_type and bound_type is required.
+  static constexpr auto vt_padding = std::alignment_of_v<value_type> - 1;
   static constexpr auto bt_padding = std::alignment_of_v<bound_type> - 1;
   const auto vt_mem = vt_shared_mem_regions * num_threads * sizeof(value_type);
   const auto bt_mem = bt_shared_mem_regions * num_warps * sizeof(bound_type);
-  return vt_mem + bt_padding + bt_mem;
+  return vt_padding + vt_mem + bt_padding + bt_mem;
 }
 
+template<typename T, typename U>
+__device__ std::span<T>
+  reinterpret_span_or_empty(std::span<U> from)
+{
+  // If `from` is too small to fit either the padding, we'll return
+  // an empty span
+  auto *ptr          = deposit_kernel::align_up<T>(from.data());
+  const auto padding = reinterpret_cast<std::uintptr_t>(ptr) -
+                       reinterpret_cast<std::uintptr_t>(from.data());
+  const auto total_bytes = from.size() * sizeof(U);
+  if(padding >= total_bytes) return std::span<T>(ptr, 0);
+  return std::span<T>(ptr, (total_bytes - padding) / sizeof(T));
+}
 }  // namespace deposit_kernel
 
 namespace pic {
@@ -134,6 +145,7 @@ __global__ void
       return ptrs;
     }();
 
+  // This can coexist with shared_xs, these are stored after them.
   [[maybe_unused]] const std::array<bound_type *, deposit_kernel::bt_shared_mem_regions>
     shared_bounds = [&]() {
       // We're using the same shared memory arena for value_types and bound_types.
@@ -150,9 +162,16 @@ __global__ void
       return ptrs;
     }();
 
+  // We're aliasing the same shared memory as the two arrays above.
+  // This cannot coexist with them.
+  [[maybe_unused]] auto box =
+    deposit_kernel::reinterpret_span_or_empty<value_type, std::byte>(
+      std::span<std::byte>(scratch, num_shared_bytes));
+
   const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
   const auto stride = blockDim.x * gridDim.x;
-  for(auto idx = tid; idx < ids_mds.size(); idx += stride) {}
+  for(auto idx = tid; idx < ids_mds.size(); idx += stride) {
+  }
 }
 }  // namespace pic
    //// struct Scratch {
