@@ -21,7 +21,24 @@
 #include <utility>
 #include <variant>
 
+#if defined(__HIPCC__)
+  #include <hip/hip_version.h>
+#endif
+
 namespace deposit_kernel {
+
+template<typename T>
+__device__ inline T shfl_down(T val, unsigned delta) {
+#if defined(__HIPCC__) && (HIP_VERSION_MAJOR < 7)
+  // Sync shuffles unsupported on older HIP; non-sync is the native primitive.
+  return __shfl_down(val, delta);
+#else
+  // CUDA (>=9), or HIP >= 7. Use -1 so the mask is all-ones at the
+  // parameter's width: 32-bit on wave32/Nvidia, 64-bit on wave64.
+  return __shfl_down_sync(static_cast<unsigned long long>(-1), val, delta);
+#endif
+}
+
 __host__ __device__ constexpr std::size_t
   num_warps(std::size_t num_threads, std::size_t warp_size)
 {
@@ -52,7 +69,7 @@ __device__ T
   // N.B. Every lane must participate in this!
   // If some lanes are inactive, this'll produce incorrect results.
   for(auto src_lane = warpSize / 2u; src_lane >= 1u; src_lane /= 2u) {
-    t = f(t, __shfl_down(t, src_lane));
+    t = f(t, shfl_down(t, src_lane));
   }
 
   return t;
@@ -143,7 +160,7 @@ __global__ void
   const auto stride = blockDim.x * gridDim.x;
   // The warp reductions inside won't work if length of data is not
   // a multiple of warpSize, because the last threads of the last warp will not execute
-  // the loop bode. Thus, we must loop over a length that is a multiple of the warpSize
+  // the loop body. Thus, we must loop over a length that is a multiple of the warpSize
   // and guard data access if the index is out of range.
   const auto misalignment = ids_mds.size() & (warpSize - 1ul);
   const auto end =
@@ -285,27 +302,27 @@ __global__ void
         aabb_max[i] = shared_bounds[i + 3u][0];
       }
 
+      // We've padded the loop counter and not skipping dead particles, so this is safe.
+      __syncthreads();
+
       // Fit the block-wide bounding box to the max_capacity of scratch
-      if(im_alive) {
-        auto extent = aabb_max - aabb_min + Vec3i { 2u, 2u, 2u };
-        const auto max_capacity =
-          deposit_kernel::max_capacity_of_memory_for_type<value_type>(
-            std::span<std::byte>(scratch, num_shared_bytes));
+      auto extent = aabb_max - aabb_min + Vec3i { 2u, 2u, 2u };
+      const auto max_capacity =
+        deposit_kernel::max_capacity_of_memory_for_type<value_type>(
+          std::span<std::byte>(scratch, num_shared_bytes));
 
-        // We'll be storing three boxes in the same volume, because we'll be
-        // storing a current of Vec3 in the same scratch memory.
-        // This may reduce one dimension to zero, if the scratch space cannot
-        // fit even three values of value_type
-        while(max_capacity < 3u * deposit_kernel::prod(extent)) {
-          const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
-                                                 : (extent[1u] > extent[2u] ? 1u : 2u);
-          extent[i] -= 1u;
-        }
-
-        aabb_max = aabb_min + extent;
+      // We'll be storing three boxes in the same volume, because we'll be
+      // storing a current of Vec3 in the same scratch memory.
+      // This may reduce one dimension to zero, if the scratch space cannot
+      // fit even three values of value_type
+      while(max_capacity < 3u * deposit_kernel::prod(extent)) {
+        const auto i = extent[0u] > extent[1u] ? (extent[0u] > extent[2u] ? 0u : 2u)
+                                               : (extent[1u] > extent[2u] ? 1u : 2u);
+        extent[i] -= 1u;
       }
 
-      // Return the cached x1 and x2 values and the computed bounds
+      // Return the cached x1 and x2 values and the computed lower bound + extent of
+      // bounds
       return std::make_tuple(
         Vec3v {
           shared_xs[0][threadIdx.x],
@@ -318,10 +335,10 @@ __global__ void
           shared_xs[5][threadIdx.x],
         },
         aabb_min,
-        aabb_max);
+        extent);
     };
 
-    const auto [x1, x2, aabb_min, aabb_max] = positions_and_bounds();
+    const auto [x1, x2, aabb_min, extent] = positions_and_bounds();
 
     // Create value_type span viewing shared memory for storing the currents
     auto vt_span = deposit_kernel::reinterpret_span_or_empty<value_type, std::byte>(
@@ -330,8 +347,11 @@ __global__ void
     // Threads of the block loop over the vt_span and set the values to zero
     for(auto i = threadIdx.x; i < vt_span.size(); i += blockDim.x) {
       // operator[] of span does bounds checking with a host function
-      vt_span.data()[i] = value_type { 0u };
+      vt_span.data()[i] = value_type { 0 };
     }
+
+    // Still no dead particles skipped, so safe.
+    __syncthreads();
 
     // In positions_and_bounds we've decreased the aabb_max until the bounds
     // fit within the available shared memory.
@@ -341,7 +361,6 @@ __global__ void
       vt_span.data() + 2ul * (vt_span.size() / 3ul),
     };
 
-    const auto extent        = im_alive ? aabb_max - aabb_min : Vec3i { 0u, 0u, 0u };
     const auto store_current = [&](const Vec3i &point, const Vec3v &current) {
       auto contained = [&](auto point) {
         bool contained = true;
@@ -377,8 +396,8 @@ __global__ void
 
     // Float floor for relay and weight computation (pure float — no 64-bit
     // integers)
-    const auto fi1 = Vec3v(sstd::floor(x1(0)), sstd::floor(x1(1)), sstd::floor(x1(2)));
-    const auto fi2 = Vec3v(sstd::floor(x2(0)), sstd::floor(x2(1)), sstd::floor(x2(2)));
+    const auto fi1 = Vec3v(sstd::floor(x1[0]), sstd::floor(x1[1]), sstd::floor(x1[2]));
+    const auto fi2 = Vec3v(sstd::floor(x2[0]), sstd::floor(x2[1]), sstd::floor(x2[2]));
 
     const auto relay = [&](const runko::index_t j) -> value_type {
       const auto a  = sstd::min(fi1(j), fi2(j)) + value_type { 1 };
@@ -405,10 +424,6 @@ __global__ void
     const auto [Wx2, Wy2, Wz2] = W2.data;
 
     static constexpr auto one = value_type { 1 };
-
-    // Earlier we zerods the shared memory through vt_span.
-    // We must synchronize all threads before we start storing there.
-    __syncthreads();
 
     if(im_alive) {
       store_current(
@@ -452,7 +467,8 @@ __global__ void
     // Wait until all threads are done with storing values.
     __syncthreads();
 
-    // Move from shared memory to global
+    // Move from shared memory to global. Extent is block wide and same for even the
+    // dead particles, so every thread can participate.
     const auto volume = deposit_kernel::prod(extent);
     for(auto shmem_idx = threadIdx.x; shmem_idx < volume; shmem_idx += blockDim.x) {
       const auto si = (Vec3i { shmem_idx / (extent[1] * extent[2]),
