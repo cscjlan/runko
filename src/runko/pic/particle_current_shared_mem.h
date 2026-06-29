@@ -217,38 +217,43 @@ INLINE DEVICE T
 }
 
 struct Scratch {
+private:
   std::span<std::byte> scratch;
 
   template<typename T>
-  INLINE DEVICE T* data()
+  INLINE DEVICE decltype(auto) padding_to_alignment() const
   {
     static constexpr auto alignment = std::alignment_of_v<T>;
     const auto address              = reinterpret_cast<std::uintptr_t>(scratch.data());
     const auto bytes_over_alignment = address & (alignment - 1ul);
     const auto padding =
       bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
-    return static_cast<T*>(static_cast<void*>(scratch.data() + padding));
+    return padding;
+  }
+
+public:
+  template<typename T>
+  INLINE DEVICE T* data()
+  {
+    return static_cast<T*>(
+      static_cast<void*>(scratch.data() + padding_to_alignment<T>()));
   }
 
   template<typename T>
   INLINE DEVICE const T* data() const
   {
-    static constexpr auto alignment = std::alignment_of_v<T>;
-    const auto address              = reinterpret_cast<std::uintptr_t>(scratch.data());
-    const auto bytes_over_alignment = address & (alignment - 1ul);
-    const auto padding =
-      bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
-    return static_cast<T*>(static_cast<void*>(scratch.data() + padding));
+    return static_cast<const T*>(
+      static_cast<const void*>(scratch.data() + padding_to_alignment<T>()));
   }
 
   template<typename T>
-  INLINE DEVICE T& operator[](std::size_t i)
+  INLINE DEVICE T& at(std::size_t i)
   {
     return data<T>()[i];
   }
 
   template<typename T>
-  INLINE DEVICE const T& operator[](std::size_t i) const
+  INLINE DEVICE const T& at(std::size_t i) const
   {
     return data<T>()[i];
   }
@@ -256,12 +261,7 @@ struct Scratch {
   template<typename T>
   INLINE DEVICE std::size_t size() const
   {
-    static constexpr auto alignment = std::alignment_of_v<T>;
-    const auto address              = reinterpret_cast<std::uintptr_t>(scratch.data());
-    const auto bytes_over_alignment = address & (alignment - 1ul);
-    const auto padding =
-      bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
-    return (scratch.size() - padding) / sizeof(T);
+    return (scratch.size() - padding_to_alignment<T>()) / sizeof(T);
   }
 
   template<typename T>
@@ -288,6 +288,15 @@ struct Box {
   Vec3i min    = { ~0u, ~0u, ~0u };
   Vec3i extent = { 0u, 0u, 0u };
 
+  // TODO:
+  // Inactive threads have ~0u in min and 0u in max
+  // extent will then be wrong
+  // Should also check max >= min, otherwise will underflow
+  // This should probably be rewritten:
+  // don't have box, just have aabb_min and aabb_max.
+  // Once we're done with reducing them, start using extent.
+  // Have them in the "higher" level function, and implement these
+  // box functions as free functions or lambdas.
   DEVICE INLINE Box(const Vec3i& aabb_min, const Vec3i& aabb_max) :
     min(aabb_min),
     extent(aabb_max - min)
@@ -315,6 +324,7 @@ struct Box {
     Vec3i aabb_max = min + extent;
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
+      // Only lane 0 contains the reduced value
       min[i]      = warp_reduce(min[i], sstd::min<std::uint32_t>);
       aabb_max[i] = warp_reduce(aabb_max[i], sstd::max<std::uint32_t>);
     }
@@ -327,10 +337,9 @@ struct Box {
     if(0 == detail::lid()) {
 #pragma unroll
       for(auto i = 0u; i < 3u; i++) {
-        scratch.operator[]<std::uint32_t>(detail::wid() + i * detail::num_warps()) =
-          min[i];
-        scratch.operator[]<std::uint32_t>(
-          detail::wid() + (3u + i) * detail::num_warps()) = aabb_max[i];
+        scratch.at<std::uint32_t>(detail::wid() + i * detail::num_warps()) = min[i];
+        scratch.at<std::uint32_t>(detail::wid() + (3u + i) * detail::num_warps()) =
+          aabb_max[i];
       }
     }
 
@@ -346,13 +355,13 @@ struct Box {
       // Only lanes with lane id < num_warps read the num_warps values from
       // scratch
       if(detail::lid() < detail::num_warps()) {
-        val =
-          scratch.operator[]<std::uint32_t>(detail::lid() + i * detail::num_warps());
+        val = scratch.at<std::uint32_t>(detail::lid() + i * detail::num_warps());
       }
       const auto f = i < 3u ? sstd::min<std::uint32_t> : sstd::max<std::uint32_t>;
 
       // All lanes participate, but lane 0 only contains reductions from first
-      // num_warps lanes.
+      // num_warps lanes. This assumes num_warps is a power of two.
+      // N.B. block size must be warpSize * 2^k
       for(auto j = detail::num_warps() / 2u; j >= 1u; j /= 2u) {
         val = f(val, detail::shfl_down(val, j));
       }
@@ -361,7 +370,7 @@ struct Box {
       // Store in the same location this warp read from to avoid data races
       // with other warps.
       if(0 == detail::lid()) {
-        scratch.operator[]<std::uint32_t>(i * detail::num_warps()) = val;
+        scratch.at<std::uint32_t>(i * detail::num_warps()) = val;
       }
     }
 
@@ -372,8 +381,8 @@ struct Box {
     // all the points considered by the block.
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
-      min[i]      = scratch.operator[]<std::uint32_t>(i * detail::num_warps());
-      aabb_max[i] = scratch.operator[]<std::uint32_t>((i + 3u) * detail::num_warps());
+      min[i]      = scratch.at<std::uint32_t>(i * detail::num_warps());
+      aabb_max[i] = scratch.at<std::uint32_t>((i + 3u) * detail::num_warps());
     }
 
     extent = aabb_max - min;
@@ -418,7 +427,7 @@ struct Box {
 #pragma unroll
     for(auto i = 0u; i < 3u; i++) {
       sstd::atomic_add(
-        &scratch.operator[]<value_type>(idx + i * num_cells_per_component),
+        &scratch.at<value_type>(idx + i * num_cells_per_component),
         current[i]);
     }
   }
@@ -443,7 +452,7 @@ struct Box {
 #pragma unroll
       for(auto i = 0u; i < 3u; i++) {
         const auto val =
-          scratch.operator[]<value_type>(shmem_idx + i * num_cells_per_component);
+          scratch.at<value_type>(shmem_idx + i * num_cells_per_component);
         if(0 != val) { sstd::atomic_add(J[i], val); }
       }
     }
@@ -471,10 +480,11 @@ DEVICE INLINE std::pair<Vec3i, Vec3i>
       elem_idx += detail::bdim()) {
     if(ids_mds[elem_idx][] == runko::dead_prtc_id) { continue; }
 
-    const auto u = Vec3v(vel_mds[elem_idx]);
+    const auto u = Vec3v(vel_mds[elem_idx]).template as<value_type>();
     const auto invgam =
       value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
-    const auto x2 = Vec3v(pos_mds[elem_idx]) - Vec3v(lattice_origo_coordinates);
+    const auto x2 = Vec3v(pos_mds[elem_idx]).template as<value_type>() -
+                    Vec3v(lattice_origo_coordinates).template as<value_type>();
     const auto x1 = x2 - cfl * invgam * u;
     const auto i1 = x1.template as<std::uint32_t>();
     const auto i2 = x2.template as<std::uint32_t>();
@@ -506,7 +516,9 @@ DEVICE void
 {
   using Vec3v = toolbox::Vec3<value_type>;
 
-  const auto count                = sstd::min(ids_mds.size(), num_box_candidates);
+  // If num_box_candidates is smaller than the chunk size, we'll construct
+  // the bounding box considering only a part of the particles in the chunk.
+  const auto count                = sstd::min(chunk_size, num_box_candidates);
   const auto [aabb_min, aabb_max] = compute_thread_bounds(
     cfl,
     chunk_offset,
@@ -517,8 +529,9 @@ DEVICE void
     lattice_origo_coordinates);
 
   Scratch scratch = { scratch_memory };
+  [aabb_min] = bound_thread_boxes(scratch);
+
   Box<value_type> box(aabb_min, aabb_max);
-  box.bound_thread_boxes(scratch);
   const auto new_size = box.fit_to_scratch(scratch);
   scratch.resize<value_type>(new_size);
   scratch.set_to_zero();
@@ -642,13 +655,14 @@ GLOBAL void
     JMDS Jmds,
     const std::array<value_type, 3> lattice_origo_coordinates)
 {
+  static_assert(std::is_floating_point_v<value_type>);
   extern SHARED std::byte scratch[];
 
   // At least a 2x2x2 box of Vec3 must fit into scratch
   // box creation also uses scratch and requires 6 * num_warps *
   // sizeof(std::uint32_t) bytes
-  assert(num_shared_bytes > 3u * 2u * 2u * 2u * sizeof(value_type));
-  assert(num_shared_bytes > 6u * detail::num_warps() * sizeof(std::uint32_t));
+  assert(num_shared_bytes >= 3u * 2u * 2u * 2u * sizeof(value_type));
+  assert(num_shared_bytes >= 6u * detail::num_warps() * sizeof(std::uint32_t));
 
   std::span<std::byte> scratch_memory(scratch, num_shared_bytes);
 

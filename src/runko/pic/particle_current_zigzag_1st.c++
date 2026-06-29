@@ -358,6 +358,11 @@ void
   const std::uint32_t num_chunks         = static_cast<std::uint32_t>(pos_mds.size() / chunk_size) + 1ul;
   const std::uint32_t num_box_candidates = blocks.x;
 
+  // Number of threads in a block should be a multiple of 64
+  // and a power of two,
+  // so 64, 128, 256, 512 or 1024
+  assert(threads & 63 == 0);
+  assert(threads & (threads - 1) == 0);
   deposit_current_kernel<<<blocks, threads, num_shared_bytes, 0>>>(
     num_chunks,
     chunk_size,
