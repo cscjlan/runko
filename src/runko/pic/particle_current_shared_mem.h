@@ -51,7 +51,7 @@ __device__ T
   // Only lane 0 will contain the reduced value
   // N.B. Every lane must participate in this!
   // If some lanes are inactive, this'll produce incorrect results.
-  for(auto src_lane = warpSize / 2; src_lane >= 1; src_lane /= 2) {
+  for(auto src_lane = warpSize / 2u; src_lane >= 1u; src_lane /= 2u) {
     t = f(t, __shfl_down(t, src_lane));
   }
 
@@ -98,7 +98,7 @@ __device__ std::span<T>
   const auto padding = reinterpret_cast<std::uintptr_t>(ptr) -
                        reinterpret_cast<std::uintptr_t>(from.data());
   const auto total_bytes = from.size() * sizeof(U);
-  if(padding >= total_bytes) return std::span<T>(ptr, 0);
+  if(padding >= total_bytes) { return std::span<T>(ptr, 0); }
   return std::span<T>(ptr, (total_bytes - padding) / sizeof(T));
 }
 }  // namespace deposit_kernel
@@ -112,14 +112,17 @@ template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
 __global__ void
   deposit_current_kernel(
     [[maybe_unused]] std::size_t num_shared_bytes,
-    const value_type,
+    const value_type cfl,
     const value_type,
     IMDS ids_mds,
-    VMDS,
-    VMDS,
+    VMDS vel_mds,
+    VMDS pos_mds,
     JMDS,
-    const std::array<value_type, 3>)
+    const std::array<value_type, 3> lattice_origo_coordinates)
 {
+  using Vec3v = Vec3<value_type>;
+  using Vec3i = Vec3<std::uint32_t>;
+
   extern __shared__ std::byte scratch[];
 
   // value_type must be a floating point type
@@ -171,76 +174,100 @@ __global__ void
   const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
   const auto stride = blockDim.x * gridDim.x;
   for(auto idx = tid; idx < ids_mds.size(); idx += stride) {
+    // N.B. Must not use continue to skip dead particles before
+    // we're done with warp reductions. Otherwise they can produce garbage
+    const auto u = Vec3v(vel_mds[idx]).template as<value_type>();
+    const auto invgam =
+      value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
+    const auto x2 = Vec3v(pos_mds[idx]).template as<value_type>() -
+                    Vec3v(lattice_origo_coordinates).template as<value_type>();
+    const auto x1 = x2 - cfl * invgam * u;
+
+    // Cache the computed/loaded x values in shared memory
+    shared_xs[0][threadIdx.x] = x1[0];
+    shared_xs[1][threadIdx.x] = x1[1];
+    shared_xs[2][threadIdx.x] = x1[2];
+    shared_xs[3][threadIdx.x] = x2[0];
+    shared_xs[4][threadIdx.x] = x2[1];
+    shared_xs[5][threadIdx.x] = x2[2];
+
+    const auto i1 = x1.template as<bound_type>();
+    const auto i2 = x2.template as<bound_type>();
+
+    Vec3i aabb_min = { ~0u, ~0u, ~0u };
+    Vec3i aabb_max = { 0u, 0u, 0u };
+    // Only replace the reduction identities if we're dealing with a live particle
+    if(ids_mds[idx][] != runko::dead_prtc_id) {
+      for(auto i = 0u; i < 3u; i++) {
+        aabb_min[i] = sstd::min(aabb_min[i], sstd::min(i1[i], i2[i]));
+        aabb_max[i] = sstd::max(aabb_max[i], sstd::max(i1[i], i2[i]));
+      }
+    }
+
+    // Each thread has their own bounding box. Let's bound all the boxes
+    // so there's one block-wide bounding box, which we'll distribute
+    // to each thread.
+
+    // Gather the bounds from the lanes of the warp to lane 0
+    for(auto i = 0u; i < 3u; i++) {
+      aabb_min[i] =
+        deposit_kernel::warp_reduce_to_lane_0(aabb_min[i], sstd::min<bound_type>);
+      aabb_max[i] =
+        deposit_kernel::warp_reduce_to_lane_0(aabb_max[i], sstd::max<bound_type>);
+    }
+
+    const auto wid       = deposit_kernel::warp_id();
+    const auto num_warps = deposit_kernel::num_warps(blockDim.x, warpSize);
+
+    // Lane 0 stores the bounds to scratch memory:
+    if(0 == deposit_kernel::lane_id()) {
+      for(auto i = 0u; i < 3u; i++) {
+        shared_bounds[i][wid]      = aabb_min[i];
+        shared_bounds[i + 3u][wid] = aabb_max[i];
+      }
+    }
+
+    __syncthreads();
+
+    // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps
+    // need to reduce more than one bound. If there are more than six warps,
+    // the first six warps do the reductions in parallel.
+    for(auto i = wid; i < 6u; i += num_warps) {
+      // First three warps reduce minimums, last three maximums
+      bound_type val = bound_type { ~0u };
+      auto f         = sstd::min<bound_type>;
+      if(i >= 3u) {
+        val = bound_type { 0 };
+        f   = sstd::max<bound_type>;
+      }
+
+      // Only lanes with lane id < num_warps read the num_warps values from
+      // scratch
+      if(deposit_kernel::lane_id() < num_warps) {
+        val = shared_bounds[i][deposit_kernel::lane_id()];
+      }
+
+      // All lanes must participate in the reduction to produce correct values
+      val = deposit_kernel::warp_reduce_to_lane_0(val, f);
+
+      // Lane 0 stores the reduced bound back to scratch.
+      // Store in the same location this warp read from to avoid data races
+      // with other warps.
+      if(0 == deposit_kernel::lane_id()) { shared_bounds[i][0] = val; }
+    }
+
+    __syncthreads();
+
+    // Finally, every thread of every warp reads the block-wide bounds
+    // from scratch memory. After this, every thread has the box that bounds
+    // all the points considered by the block.
+    for(auto i = 0u; i < 3u; i++) {
+      aabb_min[i] = shared_bounds[i][0];
+      aabb_max[i] = shared_bounds[i + 3u][0];
+    }
   }
 }
 }  // namespace pic
-   //// struct Scratch {
-// private:
-//   std::span<std::byte> scratch;
-//
-//   template<typename T>
-//   __forceinline__ __device__ decltype(auto) padding_to_alignment() const
-//   {
-//     static constexpr auto alignment = std::alignment_of_v<T>;
-//     const auto address              =
-//     reinterpret_cast<std::uintptr_t>(scratch.data()); const auto bytes_over_alignment
-//     = address & (alignment - 1ul); const auto padding =
-//       bytes_over_alignment > 0ul ? alignment - bytes_over_alignment : 0ul;
-//     return padding;
-//   }
-//
-// public:
-//   template<typename T>
-//   __forceinline__ __device__ T* data()
-//   {
-//     return static_cast<T*>(
-//       static_cast<void*>(scratch.data() + padding_to_alignment<T>()));
-//   }
-//
-//   template<typename T>
-//   __forceinline__ __device__ const T* data() const
-//   {
-//     return static_cast<const T*>(
-//       static_cast<const void*>(scratch.data() + padding_to_alignment<T>()));
-//   }
-//
-//   template<typename T>
-//   __forceinline__ __device__ T& at(std::size_t i)
-//   {
-//     return data<T>()[i];
-//   }
-//
-//   template<typename T>
-//   __forceinline__ __device__ const T& at(std::size_t i) const
-//   {
-//     return data<T>()[i];
-//   }
-//
-//   template<typename T>
-//   __forceinline__ __device__ std::size_t size() const
-//   {
-//     return (scratch.size() - padding_to_alignment<T>()) / sizeof(T);
-//   }
-//
-//   template<typename T>
-//   __forceinline__ __device__ void resize(std::size_t i)
-//   {
-//     std::byte* end = static_cast<std::byte*>(static_cast<void*>(data<T>() + i));
-//     scratch        = std::span<std::byte>(
-//       scratch.data(),
-//       static_cast<std::size_t>(end - scratch.data()));
-//   }
-//
-//   __forceinline__ __device__ void set_to_zero()
-//   {
-//     for(auto i = deposit_kernel::tid(); i < scratch.size(); i +=
-//     deposit_kernel::bdim()) {
-//       scratch.data()[i] = std::byte { 0 };
-//     }
-//     __syncthreads();
-//   }
-// };
-//
 //// This assumes cells can never be negative
 // template<typename value_type>
 // struct Box {
@@ -275,79 +302,6 @@ __global__ void
 //
 //   __forceinline__ __device__ void bound_thread_boxes(Scratch scratch)
 //   {
-//     // Each thread has their own bounding box. This function
-//     // bounds all the individual bounding boxes to a block-wide bounding box,
-//     // which each of the threads will then share.
-//
-//     // Gather the bounds from the lanes of the warp to lane 0
-//     Vec3i aabb_max = min + extent;
-// #pragma unroll
-//     for(auto i = 0u; i < 3u; i++) {
-//       min[i] = deposit_kernel::warp_reduce_to_lane_0(min[i], sstd::min<bound_type>);
-//       aabb_max[i] =
-//         deposit_kernel::warp_reduce_to_lane_0(aabb_max[i], sstd::max<bound_type>);
-//     }
-//
-//     // Lane 0 stores the bounds to scratch memory:
-//     // First num_warps values contain min[0] for each warp,
-//     // next num_warps values contain min[1] for each warp,
-//     // then min[2],
-//     // then max[0] and so on.
-//     if(0 == deposit_kernel::lid()) {
-// #pragma unroll
-//       for(auto i = 0u; i < 3u; i++) {
-//         scratch.at<bound_type>(deposit_kernel::wid() + i *
-//         deposit_kernel::num_warps()) = min[i];
-//         scratch.at<bound_type>(deposit_kernel::wid() + (3u + i) *
-//         deposit_kernel::num_warps()) =
-//           aabb_max[i];
-//       }
-//     }
-//
-//     __syncthreads();
-//
-//     // If num_warps is less than six (i.e. blockDim.x < 6 * 64), some warps
-//     // need to reduce more than one bound. If there are more than six warps,
-//     // the first six warps do the reductions is parallel.
-//     for(auto i = deposit_kernel::wid(); i < 6u; i += deposit_kernel::num_warps()) {
-//       // Each thread participates to avoid deadlock with syncthreads
-//       bound_type val = bound_type {0};
-//
-//       // Only lanes with lane id < num_warps read the num_warps values from
-//       // scratch
-//       if(deposit_kernel::lid() < deposit_kernel::num_warps()) {
-//         val = scratch.at<bound_type>(deposit_kernel::lid() + i *
-//         deposit_kernel::num_warps());
-//       }
-//       const auto f = i < 3u ? sstd::min<bound_type> : sstd::max<bound_type>;
-//
-//       // All lanes participate, but lane 0 only contains reductions from first
-//       // num_warps lanes. This assumes num_warps is a power of two.
-//       // N.B. block size must be warpSize * 2^k
-//       for(auto j = deposit_kernel::num_warps() / 2u; j >= 1u; j /= 2u) {
-//         val = f(val, __shfl_down(val, j));
-//       }
-//
-//       // Lane 0 stores the reduced bound back to scratch.
-//       // Store in the same location this warp read from to avoid data races
-//       // with other warps.
-//       if(0 == deposit_kernel::lid()) {
-//         scratch.at<bound_type>(i * deposit_kernel::num_warps()) = val;
-//       }
-//     }
-//
-//     __syncthreads();
-//
-//     // Finally, every thread of every warp reads the block-global bounds
-//     // from scratch memory. After this, every thread has the box that bounds
-//     // all the points considered by the block.
-// #pragma unroll
-//     for(auto i = 0u; i < 3u; i++) {
-//       min[i]      = scratch.at<bound_type>(i * deposit_kernel::num_warps());
-//       aabb_max[i] = scratch.at<bound_type>((i + 3u) * deposit_kernel::num_warps());
-//     }
-//
-//     extent = aabb_max - min;
 //   }
 //
 //   __forceinline__ __device__ std::size_t fit_to_scratch(Scratch scratch)
@@ -425,44 +379,6 @@ __global__ void
 //     __syncthreads();
 //   }
 // };
-//
-// template<typename value_type, typename VMDS, typename IMDS>
-//__forceinline__ __device__ std::pair<Vec3i, Vec3i>
-//   compute_thread_bounds(
-//     const value_type cfl,
-//     std::uint32_t offset,
-//     std::uint32_t count,
-//     IMDS ids_mds,
-//     VMDS vel_mds,
-//     VMDS pos_mds,
-//     const std::array<value_type, 3> lattice_origo_coordinates)
-//{
-//   using Vec3v = toolbox::Vec3<value_type>;
-//
-//   Vec3i aabb_min = { ~0u, ~0u, ~0u };
-//   Vec3i aabb_max = { 0u, 0u, 0u };
-//   for(auto elem_idx = offset + deposit_kernel::tid(); elem_idx < offset + count;
-//       elem_idx += deposit_kernel::bdim()) {
-//     if(ids_mds[elem_idx][] == runko::dead_prtc_id) { continue; }
-//
-//     const auto u = Vec3v(vel_mds[elem_idx]).template as<value_type>();
-//     const auto invgam =
-//       value_type { 1 } / sstd::sqrt(value_type { 1 } + toolbox::dot(u, u));
-//     const auto x2 = Vec3v(pos_mds[elem_idx]).template as<value_type>() -
-//                     Vec3v(lattice_origo_coordinates).template as<value_type>();
-//     const auto x1 = x2 - cfl * invgam * u;
-//     const auto i1 = x1.template as<bound_type>();
-//     const auto i2 = x2.template as<bound_type>();
-//
-// #pragma unroll
-//     for(auto i = 0u; i < 3; i++) {
-//       aabb_min[i] = sstd::min(aabb_min[i], sstd::min(i1[i], i2[i]));
-//       aabb_max[i] = sstd::max(aabb_max[i], sstd::max(i1[i], i2[i]));
-//     }
-//   }
-//
-//   return std::make_pair(aabb_min, aabb_max);
-// }
 //
 // template<typename value_type, typename JMDS, typename VMDS, typename IMDS>
 //__device__ void
