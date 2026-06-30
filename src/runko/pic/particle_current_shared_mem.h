@@ -28,7 +28,9 @@
 namespace deposit_kernel {
 
 template<typename T>
-__device__ inline T shfl_down(T val, unsigned delta) {
+__device__ inline T
+  shfl_down(T val, unsigned delta)
+{
 #if defined(__HIPCC__) && (HIP_VERSION_MAJOR < 7)
   // Sync shuffles unsupported on older HIP; non-sync is the native primitive.
   return __shfl_down(val, delta);
@@ -91,18 +93,24 @@ __device__ T *
   return reinterpret_cast<T *>(__builtin_align_up(ptr, std::alignment_of_v<T>));
 }
 
-static constexpr std::size_t vt_shared_mem_regions = 6ul;
-static constexpr std::size_t bt_shared_mem_regions = 6ul;
-
 template<typename value_type, typename bound_type>
 __host__ __device__ constexpr std::size_t
-  shared_mem_requirement(std::size_t num_threads, std::size_t num_warps)
+  shared_mem_requirement(std::size_t num_warps)
 {
-  static constexpr auto vt_padding = std::alignment_of_v<value_type> - 1;
+  // We need this many bytes to store the block-wide bounds:
+  // six values of bound_type for each warp + the padding required to align
+  // the pointer correctly.
   static constexpr auto bt_padding = std::alignment_of_v<bound_type> - 1;
-  const auto vt_mem = vt_shared_mem_regions * num_threads * sizeof(value_type);
-  const auto bt_mem = bt_shared_mem_regions * num_warps * sizeof(bound_type);
-  return vt_padding + vt_mem + bt_padding + bt_mem;
+  const auto bt_mem                = 6ul * num_warps * sizeof(bound_type);
+  const auto bounds_mem_req        = bt_padding + bt_mem;
+
+  // This is the absolute minimum shared memory required for a sensible box of current:
+  // 2x2x2 box for three values of value_type (Vec3 of current).
+  static constexpr auto vt_padding = std::alignment_of_v<value_type> - 1;
+  static constexpr auto current_box_mem_req =
+    2ul * 2ul * 2ul * 3ul * sizeof(value_type) + vt_padding;
+
+  return sstd::max(bounds_mem_req, current_box_mem_req);
 }
 
 template<typename T, typename U>
@@ -115,15 +123,6 @@ __device__ std::size_t
   const auto total_bytes = memory.size() * sizeof(U);
   if(padding >= total_bytes) { return 0; }
   return (total_bytes - padding) / sizeof(T);
-}
-
-template<typename T, typename U>
-__device__ std::span<T>
-  reinterpret_span_or_empty(std::span<U> from)
-{
-  return std::span<T>(
-    align_up<T>(from.data()),
-    max_capacity_of_memory_for_type<T>(from));
 }
 }  // namespace deposit_kernel
 
@@ -153,12 +152,11 @@ __global__ void
   static_assert(std::is_floating_point_v<value_type>);
   assert(
     (num_shared_bytes >= deposit_kernel::shared_mem_requirement<value_type, bound_type>(
-                           blockDim.x,
                            deposit_kernel::num_warps(blockDim.x, warpSize))));
 
   const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
   const auto stride = blockDim.x * gridDim.x;
-  // The warp reductions inside won't work if length of data is not
+  // The warp reductions inside the loop won't work if length of data is not
   // a multiple of warpSize, because the last threads of the last warp will not execute
   // the loop body. Thus, we must loop over a length that is a multiple of the warpSize
   // and guard data access if the index is out of range.
@@ -172,39 +170,6 @@ __global__ void
     const bool im_alive = idx < ids_mds.size() && runko::dead_prtc_id != ids_mds[idx][];
 
     auto positions_and_bounds = [&]() {
-      // Each thread in the block shares these pointers.
-      // They're used to store the x1 and x2 vectors that will be read from global
-      // memory (pos & vel)
-      const auto shared_xs_stride = blockDim.x;
-      const std::array<value_type *, deposit_kernel::vt_shared_mem_regions> shared_xs =
-        [&]() {
-          auto *first = deposit_kernel::align_up<value_type>(scratch);
-          std::array<value_type *, deposit_kernel::vt_shared_mem_regions> ptrs = {};
-          for(auto &ptr: ptrs) {
-            ptr = first;
-            first += shared_xs_stride;
-          }
-
-          return ptrs;
-        }();
-
-      // This can coexist with shared_xs, these are stored after them.
-      const std::array<bound_type *, deposit_kernel::bt_shared_mem_regions>
-        shared_bounds = [&]() {
-          // We're using the same shared memory arena for value_types and bound_types.
-          // Here we align the memory after the last of value_type to be suitable for
-          // bound_type.
-          auto *first =
-            deposit_kernel::align_up<bound_type>(shared_xs.back() + shared_xs_stride);
-          std::array<bound_type *, deposit_kernel::bt_shared_mem_regions> ptrs = {};
-          for(auto &ptr: ptrs) {
-            ptr = first;
-            first += deposit_kernel::num_warps(blockDim.x, warpSize);
-          }
-
-          return ptrs;
-        }();
-
       static constexpr value_type zero = value_type { 0 };
       static constexpr Vec3v zero_vec  = Vec3v { zero, zero, zero };
 
@@ -219,14 +184,6 @@ __global__ void
 
       const auto i1 = x1.template as<bound_type>();
       const auto i2 = x2.template as<bound_type>();
-
-      // Cache the computed/loaded x values in shared memory
-      shared_xs[0][threadIdx.x] = x1[0];
-      shared_xs[1][threadIdx.x] = x1[1];
-      shared_xs[2][threadIdx.x] = x1[2];
-      shared_xs[3][threadIdx.x] = x2[0];
-      shared_xs[4][threadIdx.x] = x2[1];
-      shared_xs[5][threadIdx.x] = x2[2];
 
       Vec3i aabb_min = { ~0u, ~0u, ~0u };
       Vec3i aabb_max = { 0u, 0u, 0u };
@@ -253,10 +210,11 @@ __global__ void
       const auto num_warps = deposit_kernel::num_warps(blockDim.x, warpSize);
 
       // Lane 0 stores the bounds to scratch memory:
+      auto *const bounds_ptr = deposit_kernel::align_up<bound_type>(scratch);
       if(0 == deposit_kernel::lane_id()) {
         for(auto i = 0u; i < 3u; i++) {
-          shared_bounds[i][wid]      = aabb_min[i];
-          shared_bounds[i + 3u][wid] = aabb_max[i];
+          bounds_ptr[wid + i * num_warps]        = aabb_min[i];
+          bounds_ptr[wid + (3u + i) * num_warps] = aabb_max[i];
         }
       }
 
@@ -267,7 +225,7 @@ __global__ void
       // need to reduce more than one bound. If there are more than six warps,
       // the first six warps do the reductions in parallel.
       for(auto i = wid; i < 6u; i += num_warps) {
-        auto *const bounds = shared_bounds[i];
+        auto *const bounds = &bounds_ptr[i * num_warps];
         // First three warps reduce minimums, last three maximums
         bound_type val = bound_type { ~0u };
         auto f         = sstd::min<bound_type>;
@@ -298,8 +256,8 @@ __global__ void
       // from scratch memory. After this, every thread has the box that bounds
       // all the points considered by the block.
       for(auto i = 0u; i < 3u; i++) {
-        aabb_min[i] = shared_bounds[i][0];
-        aabb_max[i] = shared_bounds[i + 3u][0];
+        aabb_min[i] = bounds_ptr[i * num_warps];
+        aabb_max[i] = bounds_ptr[(3u + i) * num_warps];
       }
 
       // We've padded the loop counter and not skipping dead particles, so this is safe.
@@ -323,44 +281,27 @@ __global__ void
 
       // Return the cached x1 and x2 values and the computed lower bound + extent of
       // bounds
-      return std::make_tuple(
-        Vec3v {
-          shared_xs[0][threadIdx.x],
-          shared_xs[1][threadIdx.x],
-          shared_xs[2][threadIdx.x],
-        },
-        Vec3v {
-          shared_xs[3][threadIdx.x],
-          shared_xs[4][threadIdx.x],
-          shared_xs[5][threadIdx.x],
-        },
-        aabb_min,
-        extent);
+      return std::make_tuple(x1, x2, aabb_min, extent, max_capacity);
     };
 
-    const auto [x1, x2, aabb_min, extent] = positions_and_bounds();
+    const auto [x1, x2, aabb_min, extent, max_capacity] = positions_and_bounds();
 
-    // Create value_type span viewing shared memory for storing the currents
-    auto vt_span = deposit_kernel::reinterpret_span_or_empty<value_type, std::byte>(
-      std::span<std::byte>(scratch, num_shared_bytes));
+    // We've returned values from shared memory, so need to synchronize before zeroing
+    // the shared memory.
+    __syncthreads();
 
-    // Threads of the block loop over the vt_span and set the values to zero
-    for(auto i = threadIdx.x; i < vt_span.size(); i += blockDim.x) {
-      // operator[] of span does bounds checking with a host function
-      vt_span.data()[i] = value_type { 0 };
+    // Align the scratch pointer to value_type for storing currents
+    auto *const shared_J = deposit_kernel::align_up<value_type>(scratch);
+
+    // Threads of the block loop over shared_J and set the values to zero
+    for(auto i = threadIdx.x; i < max_capacity; i += blockDim.x) {
+      shared_J[i] = value_type { 0 };
     }
 
     // Still no dead particles skipped, so safe.
     __syncthreads();
 
-    // In positions_and_bounds we've decreased the aabb_max until the bounds
-    // fit within the available shared memory.
-    const std::array<value_type *, 3ul> shared_Js = {
-      vt_span.data(),
-      vt_span.data() + vt_span.size() / 3ul,
-      vt_span.data() + 2ul * (vt_span.size() / 3ul),
-    };
-
+    const auto volume        = deposit_kernel::prod(extent);
     const auto store_current = [&](const Vec3i &point, const Vec3v &current) {
       auto contained = [&](auto point) {
         bool contained = true;
@@ -376,7 +317,7 @@ __global__ void
         const auto idx =
           delta[2] + delta[1] * extent[2] + delta[0] * extent[1] * extent[2];
         for(auto i = 0u; i < 3u; i++) {
-          sstd::atomic_add(&shared_Js[i][idx], current[i]);
+          sstd::atomic_add(&shared_J[idx + i * volume], current[i]);
         }
       };
 
@@ -400,9 +341,9 @@ __global__ void
     const auto fi2 = Vec3v(sstd::floor(x2[0]), sstd::floor(x2[1]), sstd::floor(x2[2]));
 
     const auto relay = [&](const runko::index_t j) -> value_type {
-      const auto a  = sstd::min(fi1(j), fi2(j)) + value_type { 1 };
-      const auto b1 = sstd::max(fi1(j), fi2(j));
-      const auto b2 = value_type { 0.5 } * (x1(j) + x2(j));
+      const auto a  = sstd::min(fi1[j], fi2[j]) + value_type { 1 };
+      const auto b1 = sstd::max(fi1[j], fi2[j]);
+      const auto b2 = value_type { 0.5 } * (x1[j] + x2[j]);
       const auto b  = sstd::max(b1, b2);
       return sstd::min(a, b);
     };
@@ -469,22 +410,26 @@ __global__ void
 
     // Move from shared memory to global. Extent is block wide and same for even the
     // dead particles, so every thread can participate.
-    const auto volume = deposit_kernel::prod(extent);
     for(auto shmem_idx = threadIdx.x; shmem_idx < volume; shmem_idx += blockDim.x) {
       const auto si = (Vec3i { shmem_idx / (extent[1] * extent[2]),
                                (shmem_idx / extent[2]) % extent[1],
                                shmem_idx % extent[2] } +
                        aabb_min)
                         .template as<runko::index_t>();
-      value_type *const J[3] = {
-        &thrust::raw_reference_cast(Jmds[si.data][0]),
-        &thrust::raw_reference_cast(Jmds[si.data][1]),
-        &thrust::raw_reference_cast(Jmds[si.data][2]),
-      };
 
-      for(auto i = 0u; i < 3u; i++) {
-        const auto val = shared_Js[i][shmem_idx];
-        if(0 != val) { sstd::atomic_add(J[i], val); }
+      if(const auto val = shared_J[shmem_idx + 0 * volume]; value_type { 0 } != val) {
+        auto *const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
+        sstd::atomic_add(Jx, val);
+      }
+
+      if(const auto val = shared_J[shmem_idx + 1 * volume]; value_type { 0 } != val) {
+        auto *const Jy = &thrust::raw_reference_cast(Jmds[si.data][1]);
+        sstd::atomic_add(Jy, val);
+      }
+
+      if(const auto val = shared_J[shmem_idx + 2 * volume]; value_type { 0 } != val) {
+        auto *const Jz = &thrust::raw_reference_cast(Jmds[si.data][2]);
+        sstd::atomic_add(Jz, val);
       }
     }
 
