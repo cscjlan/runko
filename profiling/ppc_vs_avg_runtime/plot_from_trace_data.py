@@ -67,7 +67,7 @@ f = plt.figure(figsize=(32, 18), dpi=120)
 plt.rcParams["axes.prop_cycle"] = cycler(color=color_sequences["tab20"])
 ax = f.add_subplot(111)
 ax.set_xscale("log", base=2)
-ax.set_yscale("log", base=2)
+ax.set_yscale("log", base=10)
 plt.subplots_adjust(
     left=0.095, right=0.9985, top=0.995, bottom=0.135, wspace=0.2, hspace=0.2
 )
@@ -122,4 +122,5 @@ for txt in leg.get_texts():
     txt.set_fontsize(32)
 
 ax.grid(True)
-plt.show()
+#plt.show()
+plt.savefig("ppc_vs_runtime.png")

@@ -39,7 +39,7 @@ if __name__ == "__main__":
     config.m1 = 1
     config.particle_pusher = "boris"
     config.field_interpolator = "linear_1st"
-    config.current_depositer = "zigzag_1st_atomic"
+    config.current_depositer = "zigzag_1st_shared"
     config.current_filter = "binomial2"
     config.tile_partitioning = "hilbert_curve"
     config.laps_in_timer_statistics = 20

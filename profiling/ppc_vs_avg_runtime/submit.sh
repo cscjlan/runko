@@ -55,7 +55,7 @@ export MPICH_GPU_IPC_ENABLED=0
 export VIZTRACER_OUTPUT_DIR=/scratch/project_462001358/$USER/runko_profiles/${SLURM_JOB_ID}_ppc
 mkdir -p $VIZTRACER_OUTPUT_DIR
 
-for ppc in 2 4 8 16 32 64 128 256 512 1024 2048
+for ppc in 2 4 8 16 32 64 128 256 512 1024
 do
    sed -i "s/\(^[ ]\{4\}ppc =\) [0-9]*/\1 ${ppc}/" pic.py
    srun --cpu-bind=${CPU_BIND} ./select_gpu python -m viztracer --pid_suffix --log_sparse pic.py
