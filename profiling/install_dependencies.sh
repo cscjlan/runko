@@ -39,3 +39,9 @@ python -m pip install \
     pybind11 \
     scikit-build-core \
     viztracer
+
+# Rocm 6.4.4 comes with pre-installed rocprofiler-compute,
+# but the python requirements have to be installed manually
+# https://lumi-supercomputer.github.io/LUMI-EasyBuild-docs/r/rocm/#modules-with-extra-debugging-and-performance-profiling-tools-installed
+python -m pip install -r $EBROOTROCM/libexec/rocprofiler-compute/requirements.txt
+
