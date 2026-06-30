@@ -153,6 +153,7 @@ __global__ void
   assert(
     (num_shared_bytes >= deposit_kernel::shared_mem_requirement<value_type, bound_type>(
                            deposit_kernel::num_warps(blockDim.x, warpSize))));
+  assert(blockDim.x % warpSize == 0);
 
   const auto tid    = threadIdx.x + blockIdx.x * blockDim.x;
   const auto stride = blockDim.x * gridDim.x;
@@ -160,9 +161,11 @@ __global__ void
   // a multiple of warpSize, because the last threads of the last warp will not execute
   // the loop body. Thus, we must loop over a length that is a multiple of the warpSize
   // and guard data access if the index is out of range.
-  const auto misalignment = ids_mds.size() & (warpSize - 1ul);
+  // Similarly, the __syncthreads() must be called by all the threads in the block,
+  // so the loop must for full blocks. This means blockDim.x must be a multiple of warpSize.
+  const auto misalignment = ids_mds.size() & (blockDim.x - 1ul);
   const auto end =
-    misalignment > 0ul ? ids_mds.size() + warpSize - misalignment : ids_mds.size();
+    misalignment > 0ul ? ids_mds.size() + blockDim.x - misalignment : ids_mds.size();
 
   for(auto idx = tid; idx < end; idx += stride) {
     // N.B. Must not use continue to skip dead particles before
@@ -285,10 +288,6 @@ __global__ void
     };
 
     const auto [x1, x2, aabb_min, extent, max_capacity] = positions_and_bounds();
-
-    // We've returned values from shared memory, so need to synchronize before zeroing
-    // the shared memory.
-    __syncthreads();
 
     // Align the scratch pointer to value_type for storing currents
     auto *const shared_J = deposit_kernel::align_up<value_type>(scratch);

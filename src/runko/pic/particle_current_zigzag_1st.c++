@@ -351,20 +351,23 @@ void
   const value_type charge = static_cast<value_type>(charge_);
   const value_type cfl    = static_cast<value_type>(cfl_);
 
-  const dim3 threads { 1024, 1, 1 };
-  const dim3 blocks { 1024, 1, 1 };
+  auto launch = [&]<std::uint32_t BlockSize, std::uint32_t WarpSize>(){
+    static_assert(BlockSize % WarpSize == 0);
+    static constexpr std::size_t num_shared_bytes = 32ul * 1024ul;
+    static constexpr dim3 gridSize { 1024, 1, 1 };
 
-  static constexpr std::size_t num_shared_bytes = 32ul * 1024ul;
+    deposit_current_kernel<<<gridSize, BlockSize, num_shared_bytes, 0>>>(
+      num_shared_bytes,
+      cfl,
+      charge,
+      ids_mds,
+      vel_mds,
+      pos_mds,
+      Jmds,
+      lattice_origo_coordinates);
+    [[maybe_unused]] const auto result = hipDeviceSynchronize();
+  };
 
-  deposit_current_kernel<<<blocks, threads, num_shared_bytes, 0>>>(
-    num_shared_bytes,
-    cfl,
-    charge,
-    ids_mds,
-    vel_mds,
-    pos_mds,
-    Jmds,
-    lattice_origo_coordinates);
-  [[maybe_unused]] const auto result = hipDeviceSynchronize();
+  launch.template operator()<1024u, 64u>();
 }
 }  // namespace pic
