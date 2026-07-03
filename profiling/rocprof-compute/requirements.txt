@@ -1,0 +1,15 @@
+astunparse==1.6.2
+colorlover
+dash==2.18.2
+matplotlib
+numpy>=1.17.5
+pandas==2.3.3
+pymongo
+pyyaml
+tabulate
+tqdm
+dash-svg
+dash-bootstrap-components
+kaleido==0.2.1
+setuptools
+plotille

@@ -23,14 +23,14 @@ if __name__ == "__main__":
     config = runko.Configuration(None)
 
     config.outdir = "turb-small"
-    config.Nx = 2
-    config.Ny = 2
-    config.Nz = 2
+    config.Nx = 1
+    config.Ny = 1
+    config.Nz = 1
     config.NxMesh = 64
     config.NyMesh = 64
     config.NzMesh = 64
     config.cfl = 0.45
-    config.Nt = 20
+    config.Nt = 10
     config.xmin = 0
     config.ymin = 0
     config.zmin = 0
@@ -46,11 +46,15 @@ if __name__ == "__main__":
 
 
     # Problem specific configuration
-    ppc = 128 # particles per cell (one particle type)
+    ppc = 4 # particles per cell (one particle type)
     oppc = 2 * ppc # overall particles per cell (all particle types)
     gamma = 1
     c_omp = 1
     omp = config.cfl / c_omp
+    config.prealloc_per_species = (ppc
+                                   * config.NxMesh
+                                   * config.NyMesh
+                                   * config.NzMesh)
 
     config.q0 = -gamma * (omp**2.0) / (0.5 * oppc * (1.0 + config.m0 / config.m1))
     config.q1 = abs(config.q0)
@@ -89,6 +93,7 @@ if __name__ == "__main__":
     logger.info(f"q1: {config.q1}")
     logger.info(f"m0: {config.m0}")
     logger.info(f"m1: {config.m1}")
+    logger.info(f"current depositer; {config.current_depositer }")
 
     # Decaying setup:
 
