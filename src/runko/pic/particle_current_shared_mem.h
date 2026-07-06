@@ -21,25 +21,7 @@
 #include <utility>
 #include <variant>
 
-#if defined(__HIPCC__)
-  #include <hip/hip_version.h>
-#endif
-
 namespace deposit_kernel {
-
-template<typename T>
-__device__ inline T
-  shfl_down(T val, unsigned delta)
-{
-#if defined(__HIPCC__) && (HIP_VERSION_MAJOR < 7)
-  // Sync shuffles unsupported on older HIP; non-sync is the native primitive.
-  return __shfl_down(val, delta);
-#else
-  // CUDA (>=9), or HIP >= 7. Use -1 so the mask is all-ones at the
-  // parameter's width: 32-bit on wave32/Nvidia, 64-bit on wave64.
-  return __shfl_down_sync(static_cast<unsigned long long>(-1), val, delta);
-#endif
-}
 
 __host__ __device__ constexpr std::size_t
   num_warps(std::size_t num_threads, std::size_t warp_size)
@@ -65,13 +47,12 @@ __device__ std::uint32_t
 
 template<typename T, typename F>
 __device__ T
-  warp_reduce_to_lane_0(T t, F f)
+  warp_reduce(T t, F f)
 {
-  // Only lane 0 will contain the reduced value
-  // N.B. Every lane must participate in this!
-  // If some lanes are inactive, this'll produce incorrect results.
-  for(auto src_lane = warpSize / 2u; src_lane >= 1u; src_lane /= 2u) {
-    t = f(t, shfl_down(t, src_lane));
+  // Active mask is set to full of ones: all lanes must participate or the result
+  // is undefined
+  for(auto src_lane = warpSize / 2; src_lane >= 1; src_lane /= 2) {
+    t = f(t, __shfl_xor_sync(__activemask(), t, src_lane));
   }
 
   return t;
@@ -162,7 +143,8 @@ __global__ void
   // the loop body. Thus, we must loop over a length that is a multiple of the warpSize
   // and guard data access if the index is out of range.
   // Similarly, the __syncthreads() must be called by all the threads in the block,
-  // so the loop must for full blocks. This means blockDim.x must be a multiple of warpSize.
+  // so the loop must run for full blocks. This means blockDim.x must be a multiple of
+  // warpSize.
   const auto misalignment = ids_mds.size() & (blockDim.x - 1ul);
   const auto end =
     misalignment > 0ul ? ids_mds.size() + blockDim.x - misalignment : ids_mds.size();
@@ -201,12 +183,10 @@ __global__ void
       // so there's one block-wide bounding box, which we'll distribute
       // to each thread.
 
-      // Gather the bounds from the lanes of the warp to lane 0
+      // Reduce the bounds from the lanes of the warp
       for(auto i = 0u; i < 3u; i++) {
-        aabb_min[i] =
-          deposit_kernel::warp_reduce_to_lane_0(aabb_min[i], sstd::min<bound_type>);
-        aabb_max[i] =
-          deposit_kernel::warp_reduce_to_lane_0(aabb_max[i], sstd::max<bound_type>);
+        aabb_min[i] = deposit_kernel::warp_reduce(aabb_min[i], sstd::min<bound_type>);
+        aabb_max[i] = deposit_kernel::warp_reduce(aabb_max[i], sstd::max<bound_type>);
       }
 
       const auto wid       = deposit_kernel::warp_id();
@@ -244,7 +224,7 @@ __global__ void
         }
 
         // All lanes must participate in the reduction to produce correct values
-        val = deposit_kernel::warp_reduce_to_lane_0(val, f);
+        val = deposit_kernel::warp_reduce(val, f);
 
         // Lane 0 stores the reduced bound back to scratch.
         // Store in the same location this warp read from to avoid data races
@@ -305,32 +285,66 @@ __global__ void
       auto contained = [&](auto point) {
         bool contained = true;
         for(auto i = 0u; i < 3u; i++) {
-          contained &= aabb_min[i] <= point[i] && point[i] < aabb_min[i] + extent[i];
+          contained &= aabb_min[i] <= point[i] && point[i] < (aabb_min[i] + extent[i]);
         }
 
         return contained;
       };
 
-      auto store = [&](auto point, auto current) {
+      [[maybe_unused]] auto store_reduced = [&](auto point, auto current) {
         const auto delta = point - aabb_min;
         const auto idx =
           delta[2] + delta[1] * extent[2] + delta[0] * extent[1] * extent[2];
-        for(auto i = 0u; i < 3u; i++) {
-          sstd::atomic_add(&shared_J[idx + i * volume], current[i]);
+
+        const auto active_mask = __activemask();
+        std::int32_t all_same = 0;
+        const auto mask = __match_all_sync(active_mask, idx, &all_same);
+
+        if(not all_same) {
+          // All indices are not the same within the warp, every lane adds by themselves
+          atomicAdd(&shared_J[idx + 0 * volume], current[0]);
+          atomicAdd(&shared_J[idx + 1 * volume], current[1]);
+          atomicAdd(&shared_J[idx + 2 * volume], current[2]);
+        } else {
+          // Reduce in registers and perform a single
+          // atomic add to LDS to reduce conflicts
+          for(auto lane_mask = warpSize / 2; lane_mask > 0; lane_mask /= 2) {
+            current[0] += __shfl_xor_sync(active_mask, current[0], lane_mask);
+            current[1] += __shfl_xor_sync(active_mask, current[1], lane_mask);
+            current[2] += __shfl_xor_sync(active_mask, current[2], lane_mask);
+          }
+
+          // lane 0 might not be active, so choosing the lowest bit as the leader
+          const auto leader = __ffsll(mask) - 1;
+          if(static_cast<std::int32_t>(deposit_kernel::lane_id()) == leader) {
+            atomicAdd(&shared_J[idx + 0 * volume], current[0]);
+            atomicAdd(&shared_J[idx + 1 * volume], current[1]);
+            atomicAdd(&shared_J[idx + 2 * volume], current[2]);
+          }
         }
       };
 
+      [[maybe_unused]] auto store_direct = [&](auto point, auto current) {
+        const auto delta = point - aabb_min;
+        const auto idx =
+          delta[2] + delta[1] * extent[2] + delta[0] * extent[1] * extent[2];
+
+        atomicAdd(&shared_J[idx + 0 * volume], current[0]);
+        atomicAdd(&shared_J[idx + 1 * volume], current[1]);
+        atomicAdd(&shared_J[idx + 2 * volume], current[2]);
+      };
+
       if(contained(point)) {
-        store(point, current);
+        store_reduced(point, current);
       } else {
         const auto si  = point.template as<runko::index_t>();
         auto *const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
         auto *const Jy = &thrust::raw_reference_cast(Jmds[si.data][1]);
         auto *const Jz = &thrust::raw_reference_cast(Jmds[si.data][2]);
 
-        sstd::atomic_add(Jx, current[0]);
-        sstd::atomic_add(Jy, current[1]);
-        sstd::atomic_add(Jz, current[2]);
+        atomicAdd(Jx, current[0]);
+        atomicAdd(Jy, current[1]);
+        atomicAdd(Jz, current[2]);
       }
     };
 
@@ -418,17 +432,17 @@ __global__ void
 
       if(const auto val = shared_J[shmem_idx + 0 * volume]; value_type { 0 } != val) {
         auto *const Jx = &thrust::raw_reference_cast(Jmds[si.data][0]);
-        sstd::atomic_add(Jx, val);
+        atomicAdd(Jx, val);
       }
 
       if(const auto val = shared_J[shmem_idx + 1 * volume]; value_type { 0 } != val) {
         auto *const Jy = &thrust::raw_reference_cast(Jmds[si.data][1]);
-        sstd::atomic_add(Jy, val);
+        atomicAdd(Jy, val);
       }
 
       if(const auto val = shared_J[shmem_idx + 2 * volume]; value_type { 0 } != val) {
         auto *const Jz = &thrust::raw_reference_cast(Jmds[si.data][2]);
-        sstd::atomic_add(Jz, val);
+        atomicAdd(Jz, val);
       }
     }
 
