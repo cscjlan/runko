@@ -43,5 +43,9 @@ python -m pip install \
 # Rocm 6.4.4 comes with pre-installed rocprofiler-compute,
 # but the python requirements have to be installed manually
 # https://lumi-supercomputer.github.io/LUMI-EasyBuild-docs/r/rocm/#modules-with-extra-debugging-and-performance-profiling-tools-installed
-python -m pip install -r $EBROOTROCM/libexec/rocprofiler-compute/requirements.txt
+# Instead of using the once provided at the path mentioned in the article,
+# we're using a custom one that sets
+# dash==2.18.2 and
+# pandas==2.3.3
+python -m pip install -r ${RUNKODIR}/profiling/rocprof-compute/requirements.txt
 
