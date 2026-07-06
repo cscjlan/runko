@@ -27,6 +27,8 @@ set (PIC_FILES
      ./runko/pic/reflector_wall.c++
      )
 
+     set_source_files_properties(./runko/pic/particle_current_zigzag_1st.c++ PROPERTIES COMPILE_DEFINITIONS HIP_ENABLE_WARP_SYNC_BUILTINS)
+
 set (IO_FILES
      ./runko/io/snapshots/mpiio_fields.c++
      ./runko/io/snapshots/mpiio_particles.c++
