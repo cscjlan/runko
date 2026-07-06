@@ -353,8 +353,8 @@ void
 
   auto launch = [&]<std::uint32_t BlockSize, std::uint32_t WarpSize>(){
     static_assert(BlockSize % WarpSize == 0);
-    static constexpr std::size_t num_shared_bytes = 32ul * 1024ul;
-    static constexpr dim3 gridSize { 1024, 1, 1 };
+    static constexpr std::size_t num_shared_bytes = 64u * 1024u / 32u / BlockSize / WarpSize;
+    const dim3 gridSize { ids_mds.size() / BlockSize + 1, 1, 1 };
 
     deposit_current_kernel<<<gridSize, BlockSize, num_shared_bytes, 0>>>(
       num_shared_bytes,
